@@ -2,14 +2,14 @@ import os
 import json
 import uuid
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any  # Added Dict import here
 from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query, Request as FastAPIRequest
 from fastapi.responses import StreamingResponse, JSONResponse
 import google.generativeai as genai
 from .utils.prompt import ClientMessage, convert_to_gemini_messages
-from .utils.tools import get_current_weather
+from .utils.tools import get_current_weather, create_graph
 
 load_dotenv(".env.local")
 
@@ -23,7 +23,35 @@ class Request(BaseModel):
 
 available_tools = {
     "get_current_weather": get_current_weather,
+    "create_graph": create_graph,
 }
+
+def to_serializable(obj):
+    """Recursively converts Gemini's internal types to JSON serializable formats."""
+    # Handle Gemini's Struct type (common in function call args)
+    if hasattr(obj, '_pb'):  # Protocol buffer object
+        if hasattr(obj, 'keys') and hasattr(obj, 'values'):
+            return {key: to_serializable(obj[key]) for key in obj.keys()}
+        elif hasattr(obj, '__iter__'):
+            return [to_serializable(item) for item in obj]
+    
+    # Handle dictionary-like objects
+    if hasattr(obj, 'items'):
+        return {key: to_serializable(value) for key, value in obj.items()}
+    
+    # Handle list-like objects (including RepeatedComposite)
+    if isinstance(obj, list) or type(obj).__name__ in ['RepeatedCompositeFieldContainer', 'RepeatedComposite']:
+        return [to_serializable(item) for item in obj]
+    
+    # Handle basic types
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    
+    # Fallback: try to convert to string
+    try:
+        return str(obj)
+    except:
+        return None
 
 # Define tools for Gemini
 gemini_tools = [
@@ -46,11 +74,43 @@ gemini_tools = [
                     },
                     "required": ["latitude", "longitude"],
                 },
+            },
+            {
+                "name": "create_graph",
+                "description": "Create a graph from a list of data points",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "type": "array",
+                            "description": "A list of dictionaries representing the data points",
+                            "items": {
+                                "type": "object"
+                            }
+                        },
+                        "graph_type": {
+                            "type": "string",
+                            "description": "The type of graph to generate (e.g., 'bar', 'line')",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "The title of the graph",
+                        },
+                        "x_label": {
+                            "type": "string",
+                            "description": "The label for the x-axis",
+                        },
+                        "y_label": {
+                            "type": "string",
+                            "description": "The label for the y-axis",
+                        },
+                    },
+                    "required": ["data", "graph_type"],
+                },
             }
         ]
     }
 ]
-
 def stream_text(messages_data: Dict, protocol: str = 'data'):
     try:
         logging.info(f"Data sent to Gemini: {messages_data}")
@@ -79,6 +139,9 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
             stream=True,
         )
 
+        # Track function calls to avoid duplicates
+        processed_function_calls = set()
+
         for chunk in response:
             logging.info(f"Raw response from Gemini: {chunk}")
             # Handle text content
@@ -92,13 +155,21 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
                     for part in candidate.content.parts:
                         if hasattr(part, 'function_call'):
                             function_call = part.function_call
+                            
+                            # Create a unique identifier for this function call
+                            call_signature = f"{function_call.name}_{hash(str(function_call.args))}"
+                            
+                            # Skip if we've already processed this exact function call
+                            if call_signature in processed_function_calls:
+                                continue
+                                
+                            processed_function_calls.add(call_signature)
                             tool_call_id = str(uuid.uuid4())
                             
                             # Convert args from struct to dict
                             args = {}
                             if hasattr(function_call, 'args') and function_call.args is not None:
-                                for key, value in function_call.args.items():
-                                    args[key] = value
+                                args = to_serializable(function_call.args)
                             
                             # Yield tool call
                             yield f'9:{{"toolCallId":"{tool_call_id}","toolName":"{function_call.name}","args":{json.dumps(args)}}}\n'
@@ -113,7 +184,7 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
                                     # Yield tool result
                                     yield f'a:{{"toolCallId":"{tool_call_id}","toolName":"{function_call.name}","args":{json.dumps(args)},"result":{json.dumps(result)}}}\n'
                                     
-                                    # Send function response back to model
+                                    # Send function response back to model and get final response
                                     function_response = {
                                         "function_response": {
                                             "name": function_call.name,
@@ -121,15 +192,9 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
                                         }
                                     }
                                     
-                                    # Continue conversation with function result
-                                    continue_response = chat.send_message(
-                                        [function_response],
-                                        stream=True
-                                    )
-                                    
-                                    for continue_chunk in continue_response:
-                                        if hasattr(continue_chunk, 'text') and continue_chunk.text:
-                                            yield f'0:{json.dumps(continue_chunk.text)}\n'
+                                    # Break out of the loop to avoid processing more chunks
+                                    # that might trigger the same function call again
+                                    break
                                             
                                 except Exception as e:
                                     error_result = {"error": str(e)}

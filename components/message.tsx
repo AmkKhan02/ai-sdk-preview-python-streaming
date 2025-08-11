@@ -8,6 +8,7 @@ import { Markdown } from "./markdown";
 import { PreviewAttachment } from "./preview-attachment";
 import { cn } from "@/lib/utils";
 import { Weather } from "./weather";
+import { Graph } from "./graph";
 
 export const PreviewMessage = ({
   message,
@@ -53,6 +54,8 @@ export const PreviewMessage = ({
                     <div key={toolCallId}>
                       {toolName === "get_current_weather" ? (
                         <Weather weatherAtLocation={result} />
+                      ) : toolName === "create_graph" ? (
+                        <Graph graphData={result} />
                       ) : (
                         <pre>{JSON.stringify(result, null, 2)}</pre>
                       )}
@@ -63,10 +66,10 @@ export const PreviewMessage = ({
                   <div
                     key={toolCallId}
                     className={cn({
-                      skeleton: ["get_current_weather"].includes(toolName),
+                      skeleton: ["get_current_weather", "create_graph"].includes(toolName),
                     })}
                   >
-                    {toolName === "get_current_weather" ? <Weather /> : null}
+                    {toolName === "get_current_weather" ? <Weather /> : toolName === "create_graph" ? <div className="skeleton w-full h-64" /> : null}
                   </div>
                 );
               })}

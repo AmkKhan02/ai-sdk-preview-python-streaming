@@ -13,6 +13,9 @@ import {
 } from "react";
 import { toast } from "sonner";
 import { useLocalStorage, useWindowSize } from "usehooks-ts";
+import GenerateSchema from "generate-schema";
+import Papa from "papaparse";
+import { processDuckDBFile, terminateDuckDB } from "@/lib/utils";
 
 import { cn, sanitizeUIMessages } from "@/lib/utils";
 
@@ -71,6 +74,16 @@ export function MultimodalInput({
   const { width } = useWindowSize();
   const [attachment, setAttachment] = useState<File | undefined>();
   const [isUploading, setIsUploading] = useState(false);
+  const [jsonSchema, setJsonSchema] = useState<any | null>(null);
+  const [parsedData, setParsedData] = useState<any[] | null>(null);
+  const [isGeneratingSchema, setIsGeneratingSchema] = useState(false);
+
+  // Cleanup DuckDB on unmount
+  useEffect(() => {
+    return () => {
+      terminateDuckDB();
+    };
+  }, []);
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -112,13 +125,24 @@ export function MultimodalInput({
   };
 
   const submitForm = useCallback(() => {
-    if (attachment) {
+    let messageContent = input;
+
+    // If we have parsed data from CSV, JSON, or DuckDB, include it in the message content
+    if (parsedData && attachment) {
+      const dataString = JSON.stringify(parsedData, null, 2);
+      const fileType = attachment.name.endsWith('.duckdb') || attachment.name.endsWith('.db') ? 'DuckDB database' : 
+                      attachment.name.endsWith('.csv') ? 'CSV file' : 'JSON file';
+      messageContent = `${input}\n\nI've uploaded a ${fileType} (${attachment.name}) with the following data:\n\`\`\`json\n${dataString}\n\`\`\`\n\nPlease create a bar graph from this data.`;
+    }
+
+    // For image attachments, we still need to handle them differently
+    if (attachment && attachment.type.startsWith('image/')) {
       setIsUploading(true);
       const reader = new FileReader();
       reader.onloadend = () => {
         const message = {
           role: "user" as const,
-          content: input,
+          content: messageContent,
           experimental_attachments: [
             {
               name: attachment.name,
@@ -127,9 +151,11 @@ export function MultimodalInput({
             },
           ],
         };
-        console.log("Sending message:", message);
+        console.log("Sending message with image:", message);
         append(message, {});
         setAttachment(undefined);
+        setParsedData(null);
+        setJsonSchema(null);
         setIsUploading(false);
       };
       reader.onerror = () => {
@@ -138,7 +164,16 @@ export function MultimodalInput({
       };
       reader.readAsDataURL(attachment);
     } else {
-      handleSubmit(undefined, {});
+      // For CSV files or no attachment, send as text message only
+      const message = {
+        role: "user" as const,
+        content: messageContent,
+      };
+      console.log("Sending message:", message);
+      append(message, {});
+      setAttachment(undefined);
+      setParsedData(null);
+      setJsonSchema(null);
     }
 
     setInput("");
@@ -155,7 +190,109 @@ export function MultimodalInput({
     append,
     input,
     setInput,
+    parsedData,
   ]);
+
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setAttachment(file);
+    setIsGeneratingSchema(true);
+    setJsonSchema(null);
+    setParsedData(null);
+
+    try {
+      if (file.type === "application/json") {
+        // Handle JSON files
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          try {
+            const text = e.target?.result as string;
+            const data = JSON.parse(text);
+            const schema = GenerateSchema.json(data);
+            setParsedData(Array.isArray(data) ? data : [data]);
+            setJsonSchema(schema);
+          } catch (error) {
+            toast.error("Invalid JSON file");
+            console.error("JSON parsing error:", error);
+          }
+          setIsGeneratingSchema(false);
+        };
+        reader.onerror = () => {
+          toast.error("Failed to read JSON file");
+          setIsGeneratingSchema(false);
+        };
+        reader.readAsText(file);
+      } 
+      else if (file.type === "text/csv" || file.name.endsWith('.csv')) {
+        // Handle CSV files
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          try {
+            const text = e.target?.result as string;
+            const parsedCsv = Papa.parse(text, { 
+              header: true, 
+              skipEmptyLines: true,
+              dynamicTyping: true
+            });
+            
+            if (parsedCsv.errors.length > 0) {
+              console.warn("CSV parsing warnings:", parsedCsv.errors);
+            }
+            
+            const data = parsedCsv.data;
+            const schema = GenerateSchema.json(data);
+            setParsedData(data);
+            setJsonSchema(schema);
+            
+            console.log("Parsed CSV data:", data);
+          } catch (error) {
+            toast.error("Failed to parse CSV file");
+            console.error("CSV parsing error:", error);
+          }
+          setIsGeneratingSchema(false);
+        };
+        reader.onerror = () => {
+          toast.error("Failed to read CSV file");
+          setIsGeneratingSchema(false);
+        };
+        reader.readAsText(file);
+      }
+      else if (file.name.endsWith('.duckdb') || file.name.endsWith('.db')) {
+        // Handle DuckDB files
+        await handleDuckDBFile(file);
+      }
+      else {
+        toast.error("Unsupported file type. Please upload CSV, JSON, or DuckDB files.");
+        setAttachment(undefined);
+        setIsGeneratingSchema(false);
+      }
+    } catch (error) {
+      console.error("Error processing file:", error);
+      toast.error("Failed to process file.");
+      setIsGeneratingSchema(false);
+    }
+  };
+
+  const handleDuckDBFile = async (file: File) => {
+    try {
+      const result = await processDuckDBFile(file);
+      
+      // Generate schema and set data
+      const schema = GenerateSchema.json(result.data);
+      setParsedData(result.data);
+      setJsonSchema(schema);
+      
+      toast.success(`Successfully loaded ${result.rowCount} rows from table "${result.tableName}"`);
+      
+    } catch (error) {
+      console.error("DuckDB parsing error:", error);
+      toast.error(error instanceof Error ? error.message : "Failed to parse DuckDB file. Make sure it's a valid DuckDB database.");
+    } finally {
+      setIsGeneratingSchema(false);
+    }
+  };
 
   return (
     <div className="relative w-full flex flex-col gap-4">
@@ -197,7 +334,16 @@ export function MultimodalInput({
             contentType: attachment.type,
             url: URL.createObjectURL(attachment),
           }}
-          setAttachment={setAttachment}
+          setAttachment={(file) => {
+            setAttachment(file as File | undefined);
+            if (!file) {
+              setParsedData(null);
+              setJsonSchema(null);
+            }
+          }}
+          isUploading={isUploading}
+          isGeneratingSchema={isGeneratingSchema}
+          jsonSchema={jsonSchema}
         />
       )}
 
@@ -208,6 +354,7 @@ export function MultimodalInput({
             event.preventDefault();
             fileInputRef.current?.click();
           }}
+          disabled={isUploading}
         >
           <Paperclip className="w-4 h-4" />
         </Button>
@@ -215,12 +362,9 @@ export function MultimodalInput({
         <input
           ref={fileInputRef}
           type="file"
+          accept=".csv,.json,.duckdb,.db"
           className="hidden"
-          onChange={(event) => {
-            if (event.target.files) {
-              setAttachment(event.target.files[0]);
-            }
-          }}
+          onChange={handleFileChange}
         />
 
         <Textarea
@@ -235,7 +379,6 @@ export function MultimodalInput({
           )}
           rows={3}
           autoFocus
-          disabled={isUploading}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
