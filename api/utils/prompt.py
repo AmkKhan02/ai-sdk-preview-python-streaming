@@ -1,9 +1,8 @@
 import json
 from enum import Enum
-from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 from pydantic import BaseModel
 import base64
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from .attachment import ClientAttachment
 
 class ToolInvocationState(str, Enum):
@@ -18,68 +17,79 @@ class ToolInvocation(BaseModel):
     args: Any
     result: Any
 
-
 class ClientMessage(BaseModel):
     role: str
     content: str
     experimental_attachments: Optional[List[ClientAttachment]] = None
     toolInvocations: Optional[List[ToolInvocation]] = None
 
-def convert_to_openai_messages(messages: List[ClientMessage]) -> List[ChatCompletionMessageParam]:
-    openai_messages = []
+def convert_to_gemini_messages(messages: List[ClientMessage]) -> Dict:
+    gemini_messages = []
+    system_instruction = None
 
     for message in messages:
+        # Handle system messages
+        if message.role == "system":
+            system_instruction = message.content
+            continue
+
+        # Convert role mapping
+        role = "user" if message.role in ["user", "human"] else "model"
+        
+        # Build content parts
         parts = []
-        tool_calls = []
+        
+        # Add text content
+        if message.content:
+            parts.append({
+                "text": message.content
+            })
 
-        parts.append({
-            'type': 'text',
-            'text': message.content
-        })
-
-        if (message.experimental_attachments):
+        # Handle attachments
+        if message.experimental_attachments:
             for attachment in message.experimental_attachments:
-                if (attachment.contentType.startswith('image')):
+                if attachment.contentType.startswith('image'):
+                    # For Gemini, we need to handle images differently
+                    # This assumes the attachment.url is a base64 data URL or file path
                     parts.append({
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': attachment.url
+                        "inline_data": {
+                            "mime_type": attachment.contentType,
+                            "data": attachment.url  # This might need additional processing
+                        }
+                    })
+                elif attachment.contentType.startswith('text'):
+                    parts.append({
+                        "text": f"[Attachment: {attachment.url}]"
+                    })
+
+        # Handle tool invocations/function calls
+        if message.toolInvocations:
+            for tool_invocation in message.toolInvocations:
+                if tool_invocation.state == ToolInvocationState.CALL:
+                    # This represents a function call from the model
+                    parts.append({
+                        "function_call": {
+                            "name": tool_invocation.toolName,
+                            "args": tool_invocation.args
+                        }
+                    })
+                elif tool_invocation.state == ToolInvocationState.RESULT:
+                    # This represents a function response
+                    parts.append({
+                        "function_response": {
+                            "name": tool_invocation.toolName,
+                            "response": tool_invocation.result
                         }
                     })
 
-                elif (attachment.contentType.startswith('text')):
-                    parts.append({
-                        'type': 'text',
-                        'text': attachment.url
-                    })
+        if parts:
+            gemini_messages.append({
+                "role": role,
+                "parts": parts
+            })
 
-        if(message.toolInvocations):
-            for toolInvocation in message.toolInvocations:
-                tool_calls.append({
-                    "id": toolInvocation.toolCallId,
-                    "type": "function",
-                    "function": {
-                        "name": toolInvocation.toolName,
-                        "arguments": json.dumps(toolInvocation.args)
-                    }
-                })
-
-        tool_calls_dict = {"tool_calls": tool_calls} if tool_calls else {"tool_calls": None}
-
-        openai_messages.append({
-            "role": message.role,
-            "content": parts,
-            **tool_calls_dict,
-        })
-
-        if(message.toolInvocations):
-            for toolInvocation in message.toolInvocations:
-                tool_message = {
-                    "role": "tool",
-                    "tool_call_id": toolInvocation.toolCallId,
-                    "content": json.dumps(toolInvocation.result),
-                }
-
-                openai_messages.append(tool_message)
-
-    return openai_messages
+    result = {"contents": gemini_messages}
+    if system_instruction:
+        result["system_instruction"] = {"parts": [{"text": system_instruction}]}
+    
+    return result
