@@ -3,6 +3,8 @@ from enum import Enum
 from pydantic import BaseModel
 import base64
 from typing import List, Optional, Any, Dict
+import google.generativeai as genai
+
 from .attachment import ClientAttachment
 
 class ToolInvocationState(str, Enum):
@@ -15,12 +17,12 @@ class ToolInvocation(BaseModel):
     toolCallId: str
     toolName: str
     args: Any
-    result: Any
+    result: Optional[Any] = None
 
 class ClientMessage(BaseModel):
     role: str
     content: str
-    experimental_attachments: Optional[List[ClientAttachment]] = None
+    experimental_attachments: Optional[List['ClientAttachment']] = None
     toolInvocations: Optional[List[ToolInvocation]] = None
 
 def convert_to_gemini_messages(messages: List[ClientMessage]) -> Dict:
@@ -58,37 +60,42 @@ def convert_to_gemini_messages(messages: List[ClientMessage]) -> Dict:
                         }
                     })
                 else:
-                    # Decode the base64 string for any other file type
                     try:
+                        # Decode the file content from base64
                         base64_data = attachment.url.split(',')[1]
-                        decoded_data = base64.b64decode(base64_data).decode('utf-8')
+                        file_data = base64.b64decode(base64_data).decode('utf-8')
+                        
+                        # Include the file content directly in the message
                         parts.append({
-                            "text": f"The content of the attached file `{attachment.name}` is:\n\n{decoded_data}"
+                            "text": f"The user has attached the following file: {attachment.name}\n\n---\n{file_data}\n---"
                         })
-                    except Exception:
+                        
+                    except Exception as e:
                         parts.append({
-                            "text": f"[Attachment: {attachment.name} of type {attachment.contentType} could not be read]"
+                            "text": f"[Attachment: {attachment.name} of type {attachment.contentType} could not be processed. Error: {e}]"
                         })
 
         # Handle tool invocations/function calls
         if message.toolInvocations:
             for tool_invocation in message.toolInvocations:
                 if tool_invocation.state == ToolInvocationState.CALL:
-                    # This represents a function call from the model
-                    parts.append({
-                        "function_call": {
-                            "name": tool_invocation.toolName,
-                            "args": tool_invocation.args
-                        }
-                    })
+                    if tool_invocation.toolName:
+                        # This represents a function call from the model
+                        parts.append({
+                            "function_call": {
+                                "name": tool_invocation.toolName,
+                                "args": tool_invocation.args
+                            }
+                        })
                 elif tool_invocation.state == ToolInvocationState.RESULT:
-                    # This represents a function response
-                    parts.append({
-                        "function_response": {
-                            "name": tool_invocation.toolName,
-                            "response": tool_invocation.result
-                        }
-                    })
+                    if tool_invocation.toolName:
+                        # This represents a function response
+                        parts.append({
+                            "function_response": {
+                                "name": tool_invocation.toolName,
+                                "response": tool_invocation.result
+                            }
+                        })
 
         if parts:
             gemini_messages.append({

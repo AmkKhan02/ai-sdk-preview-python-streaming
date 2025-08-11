@@ -1,11 +1,12 @@
 import os
 import json
 import uuid
+import logging
 from typing import List, Dict, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Query, Request as FastAPIRequest
+from fastapi.responses import StreamingResponse, JSONResponse
 import google.generativeai as genai
 from .utils.prompt import ClientMessage, convert_to_gemini_messages
 from .utils.tools import get_current_weather
@@ -52,6 +53,7 @@ gemini_tools = [
 
 def stream_text(messages_data: Dict, protocol: str = 'data'):
     try:
+        logging.info(f"Data sent to Gemini: {messages_data}")
         # Initialize the model
         model = genai.GenerativeModel(
             model_name="gemini-1.5-flash",
@@ -78,6 +80,7 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
         )
 
         for chunk in response:
+            logging.info(f"Raw response from Gemini: {chunk}")
             # Handle text content
             if hasattr(chunk, 'text') and chunk.text:
                 yield f'0:{json.dumps(chunk.text)}\n'
@@ -99,11 +102,13 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
                             
                             # Yield tool call
                             yield f'9:{{"toolCallId":"{tool_call_id}","toolName":"{function_call.name}","args":{json.dumps(args)}}}\n'
+                            logging.info(f"Executing tool: {function_call.name} with args: {args}")
                             
                             # Execute the function
                             if function_call.name in available_tools:
                                 try:
                                     result = available_tools[function_call.name](**args)
+                                    logging.info(f"Tool result: {result}")
                                     
                                     # Yield tool result
                                     yield f'a:{{"toolCallId":"{tool_call_id}","toolName":"{function_call.name}","args":{json.dumps(args)},"result":{json.dumps(result)}}}\n'
@@ -139,10 +144,23 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
         yield 'e:{"finishReason":"error","usage":{"promptTokens":0,"completionTokens":0},"isContinued":false}\n'
 
 @app.post("/api/chat")
-async def handle_chat_data(request: Request, protocol: str = Query('data')):
-    messages = request.messages
-    gemini_messages = convert_to_gemini_messages(messages)
+async def handle_chat_data(request: FastAPIRequest, protocol: str = Query('data')):
+    try:
+        body = await request.json()
+        logging.info(f"Request body: {body}")
+        
+        # Manually validate the request body
+        request_data = Request(**body)
+        
+        messages = request_data.messages
+        gemini_messages = convert_to_gemini_messages(messages)
 
-    response = StreamingResponse(stream_text(gemini_messages, protocol))
-    response.headers['x-vercel-ai-data-stream'] = 'v1'
-    return response
+        response = StreamingResponse(stream_text(gemini_messages, protocol))
+        response.headers['x-vercel-ai-data-stream'] = 'v1'
+        return response
+    except ValidationError as e:
+        logging.error(f"Validation error: {e.errors()}")
+        return JSONResponse(status_code=422, content={"detail": e.errors()})
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {str(e)}")
+        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})

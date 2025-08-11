@@ -70,6 +70,7 @@ export function MultimodalInput({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { width } = useWindowSize();
   const [attachment, setAttachment] = useState<File | undefined>();
+  const [isUploading, setIsUploading] = useState(false);
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -112,22 +113,28 @@ export function MultimodalInput({
 
   const submitForm = useCallback(() => {
     if (attachment) {
+      setIsUploading(true);
       const reader = new FileReader();
       reader.onloadend = () => {
-        append(
-          {
-            role: "user",
-            content: input,
-            experimental_attachments: [
-              {
-                contentType: attachment.type,
-                url: reader.result as string,
-              },
-            ],
-          },
-          {},
-        );
+        const message = {
+          role: "user" as const,
+          content: input,
+          experimental_attachments: [
+            {
+              name: attachment.name,
+              contentType: attachment.type,
+              url: reader.result as string,
+            },
+          ],
+        };
+        console.log("Sending message:", message);
+        append(message, {});
         setAttachment(undefined);
+        setIsUploading(false);
+      };
+      reader.onerror = () => {
+        toast.error("Failed to read file.");
+        setIsUploading(false);
       };
       reader.readAsDataURL(attachment);
     } else {
@@ -219,37 +226,41 @@ export function MultimodalInput({
         <Textarea
           ref={textareaRef}
           style={{ paddingLeft: "40px" }}
-        placeholder="Send a message..."
-        value={input}
-        onChange={handleInput}
-        className={cn(
-          "min-h-[24px] max-h-[calc(75dvh)] overflow-hidden resize-none rounded-xl !text-base bg-muted",
-          className,
-        )}
-        rows={3}
-        autoFocus
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey) {
-            event.preventDefault();
+          placeholder="Send a message..."
+          value={input}
+          onChange={handleInput}
+          className={cn(
+            "min-h-[24px] max-h-[calc(75dvh)] overflow-hidden resize-none rounded-xl !text-base bg-muted",
+            className,
+          )}
+          rows={3}
+          autoFocus
+          disabled={isUploading}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
 
-            if (isLoading) {
-              toast.error("Please wait for the model to finish its response!");
-            } else {
-              submitForm();
+              if (isLoading || isUploading) {
+                toast.error("Please wait for the model to finish its response!");
+              } else {
+                submitForm();
+              }
             }
-          }
-        }}
-      />
+          }}
+        />
       </div>
 
-      {isLoading ? (
+      {isLoading || isUploading ? (
         <Button
           className="rounded-full p-1.5 h-fit absolute bottom-2 right-2 m-0.5 border dark:border-zinc-600"
           onClick={(event) => {
             event.preventDefault();
-            stop();
-            setMessages((messages) => sanitizeUIMessages(messages));
+            if (isLoading) {
+              stop();
+              setMessages((messages) => sanitizeUIMessages(messages));
+            }
           }}
+          disabled={!isLoading}
         >
           <StopIcon size={14} />
         </Button>
