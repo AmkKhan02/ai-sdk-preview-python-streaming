@@ -93,7 +93,7 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
                             
                             # Convert args from struct to dict
                             args = {}
-                            if hasattr(function_call, 'args'):
+                            if hasattr(function_call, 'args') and function_call.args is not None:
                                 for key, value in function_call.args.items():
                                     args[key] = value
                             

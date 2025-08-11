@@ -7,6 +7,7 @@ import {
   useRef,
   useEffect,
   useCallback,
+  useState,
   type Dispatch,
   type SetStateAction,
 } from "react";
@@ -16,8 +17,10 @@ import { useLocalStorage, useWindowSize } from "usehooks-ts";
 import { cn, sanitizeUIMessages } from "@/lib/utils";
 
 import { ArrowUpIcon, StopIcon } from "./icons";
+import { Paperclip } from "./ui/paperclip";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
+import { PreviewAttachment } from "./preview-attachment";
 
 const suggestedActions = [
   {
@@ -64,7 +67,9 @@ export function MultimodalInput({
   className?: string;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const { width } = useWindowSize();
+  const [attachment, setAttachment] = useState<File | undefined>();
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -106,13 +111,44 @@ export function MultimodalInput({
   };
 
   const submitForm = useCallback(() => {
-    handleSubmit(undefined, {});
+    if (attachment) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        append(
+          {
+            role: "user",
+            content: input,
+            experimental_attachments: [
+              {
+                contentType: attachment.type,
+                url: reader.result as string,
+              },
+            ],
+          },
+          {},
+        );
+        setAttachment(undefined);
+      };
+      reader.readAsDataURL(attachment);
+    } else {
+      handleSubmit(undefined, {});
+    }
+
+    setInput("");
     setLocalStorageInput("");
 
     if (width && width > 768) {
       textareaRef.current?.focus();
     }
-  }, [handleSubmit, setLocalStorageInput, width]);
+  }, [
+    handleSubmit,
+    setLocalStorageInput,
+    width,
+    attachment,
+    append,
+    input,
+    setInput,
+  ]);
 
   return (
     <div className="relative w-full flex flex-col gap-4">
@@ -147,8 +183,42 @@ export function MultimodalInput({
         </div>
       )}
 
-      <Textarea
-        ref={textareaRef}
+      {attachment && (
+        <PreviewAttachment
+          attachment={{
+            name: attachment.name,
+            contentType: attachment.type,
+            url: URL.createObjectURL(attachment),
+          }}
+          setAttachment={setAttachment}
+        />
+      )}
+
+      <div className="relative flex items-center">
+        <Button
+          className="rounded-full p-1.5 h-fit absolute left-2 m-0.5 border dark:border-zinc-600"
+          onClick={(event) => {
+            event.preventDefault();
+            fileInputRef.current?.click();
+          }}
+        >
+          <Paperclip className="w-4 h-4" />
+        </Button>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          className="hidden"
+          onChange={(event) => {
+            if (event.target.files) {
+              setAttachment(event.target.files[0]);
+            }
+          }}
+        />
+
+        <Textarea
+          ref={textareaRef}
+          style={{ paddingLeft: "40px" }}
         placeholder="Send a message..."
         value={input}
         onChange={handleInput}
@@ -170,6 +240,7 @@ export function MultimodalInput({
           }
         }}
       />
+      </div>
 
       {isLoading ? (
         <Button
@@ -189,7 +260,7 @@ export function MultimodalInput({
             event.preventDefault();
             submitForm();
           }}
-          disabled={input.length === 0}
+          disabled={input.length === 0 && !attachment}
         >
           <ArrowUpIcon size={14} />
         </Button>

@@ -57,10 +57,18 @@ def convert_to_gemini_messages(messages: List[ClientMessage]) -> Dict:
                             "data": attachment.url  # This might need additional processing
                         }
                     })
-                elif attachment.contentType.startswith('text'):
-                    parts.append({
-                        "text": f"[Attachment: {attachment.url}]"
-                    })
+                else:
+                    # Decode the base64 string for any other file type
+                    try:
+                        base64_data = attachment.url.split(',')[1]
+                        decoded_data = base64.b64decode(base64_data).decode('utf-8')
+                        parts.append({
+                            "text": f"The content of the attached file `{attachment.name}` is:\n\n{decoded_data}"
+                        })
+                    except Exception:
+                        parts.append({
+                            "text": f"[Attachment: {attachment.name} of type {attachment.contentType} could not be read]"
+                        })
 
         # Handle tool invocations/function calls
         if message.toolInvocations:
