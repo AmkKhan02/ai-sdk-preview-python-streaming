@@ -175,6 +175,7 @@ When users upload DuckDB database files, you can analyze them using the execute_
 - Uses AI to create a natural language response with insights
 - Returns only the essential answer without exposing technical details
 - Handles follow-up questions using session context
+- Ensures DuckDB-compatible SQL syntax (uses 'julian' function instead of 'JULIANDAY')
 
 IMPORTANT: When a user asks questions about their uploaded data:
 
@@ -187,7 +188,7 @@ IMPORTANT: When a user asks questions about their uploaded data:
 
 The tool will automatically:
 - Extract database schema information
-- Generate appropriate SQL queries using AI
+- Generate appropriate SQL queries using AI (with DuckDB-compatible syntax)
 - Execute the queries against the database
 - Generate a comprehensive natural language response
 

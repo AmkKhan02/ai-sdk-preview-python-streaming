@@ -75,27 +75,15 @@ def convert_to_gemini_messages(messages: List[ClientMessage]) -> Dict:
                             "text": f"[Attachment: {attachment.name} of type {attachment.contentType} could not be processed. Error: {e}]"
                         })
 
-        # Handle tool invocations/function calls
-        if message.toolInvocations:
-            for tool_invocation in message.toolInvocations:
-                if tool_invocation.state == ToolInvocationState.CALL:
-                    if tool_invocation.toolName:
-                        # This represents a function call from the model
-                        parts.append({
-                            "function_call": {
-                                "name": tool_invocation.toolName,
-                                "args": tool_invocation.args
-                            }
-                        })
-                elif tool_invocation.state == ToolInvocationState.RESULT:
-                    if tool_invocation.toolName:
-                        # This represents a function response
-                        parts.append({
-                            "function_response": {
-                                "name": tool_invocation.toolName,
-                                "response": tool_invocation.result
-                            }
-                        })
+        # IMPORTANT: Exclude tool invocations/function calls from message history
+        # 
+        # The previous implementation included toolInvocations in the message history,
+        # which caused function call/response mismatches in subsequent messages.
+        # The session context (like database state) is maintained by the session manager,
+        # not by function call history. Function calls should only be processed in real-time,
+        # not replayed from history.
+        #
+        # This fixes the Error 400: "function response parts mismatch" issue.
 
         if parts:
             gemini_messages.append({

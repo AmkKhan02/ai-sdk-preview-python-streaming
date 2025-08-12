@@ -386,13 +386,13 @@ def get_sql_queries(user_prompt: str, columns_info: dict) -> List[str]:
         genai.configure(api_key=api_key)
         
         # Create the model
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         # Format schema information for the prompt
         schema_text = _format_schema_for_prompt(columns_info)
         
         # Create structured prompt for SQL generation
-        prompt = f"""You are a SQL expert. Generate SQL queries to answer the user's question based on the provided database schema. If you want to use 'JULIANDAY', you should instead use 'julian'.
+        prompt = f"""You are a SQL expert. Generate SQL queries to answer the user's question based on the provided database schema.
 
 Database Schema:
 {schema_text}
@@ -407,6 +407,12 @@ Requirements:
 5. Use proper SQL formatting and best practices
 6. Only reference tables and columns that exist in the provided schema
 7. Use standard SQL syntax compatible with DuckDB
+8. IMPORTANT DuckDB-specific function names:
+   - Use 'julian' function instead of 'JULIANDAY' for Julian day calculations
+   - Use 'DATE_DIFF' or 'DATEDIFF' for date differences (not DATE_SUB)
+   - Use 'DATE_PART' or 'EXTRACT' for extracting date parts
+   - Use 'STRPTIME' instead of 'STR_TO_DATE' for parsing dates
+   - Refer to DuckDB documentation for other function names if unsure
 
 Return your response as a JSON array of SQL query strings. Example format:
 ["SELECT * FROM table1 WHERE condition", "SELECT COUNT(*) FROM table2"]
