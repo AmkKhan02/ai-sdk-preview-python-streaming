@@ -15,12 +15,12 @@ import { toast } from "sonner";
 import { useLocalStorage, useWindowSize } from "usehooks-ts";
 import GenerateSchema from "generate-schema";
 import Papa from "papaparse";
-import { processDuckDBFile, terminateDuckDB } from "@/lib/utils";
+import { terminateDuckDB } from "@/lib/utils";
 
 import { cn, sanitizeUIMessages } from "@/lib/utils";
 
 import { ArrowUpIcon, StopIcon } from "./icons";
-import { Paperclip } from "./ui/paperclip";
+import { AttachmentButton } from "./ui/attachment-button";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { PreviewAttachment } from "./preview-attachment";
@@ -70,13 +70,20 @@ export function MultimodalInput({
   className?: string;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const { width } = useWindowSize();
-  const [attachment, setAttachment] = useState<File | undefined>();
+  
+  // Separate state management for CSV and DuckDB files
+  const [csvAttachment, setCsvAttachment] = useState<File | undefined>();
+  const [duckdbAttachment, setDuckdbAttachment] = useState<File | undefined>();
   const [isUploading, setIsUploading] = useState(false);
   const [jsonSchema, setJsonSchema] = useState<any | null>(null);
   const [parsedData, setParsedData] = useState<any[] | null>(null);
   const [isGeneratingSchema, setIsGeneratingSchema] = useState(false);
+  const [duckdbColumns, setDuckdbColumns] = useState<string[] | null>(null);
+  const [isDuckdbUploading, setIsDuckdbUploading] = useState(false);
+  
+  // Get the current attachment (either CSV or DuckDB)
+  const attachment = csvAttachment || duckdbAttachment;
 
   // Cleanup DuckDB on unmount
   useEffect(() => {
@@ -127,12 +134,16 @@ export function MultimodalInput({
   const submitForm = useCallback(() => {
     let messageContent = input;
 
-    // If we have parsed data from CSV, JSON, or DuckDB, include it in the message content
+    // If we have parsed data from CSV or DuckDB, include it in the message content
     if (parsedData && attachment) {
       const dataString = JSON.stringify(parsedData, null, 2);
-      const fileType = attachment.name.endsWith('.duckdb') || attachment.name.endsWith('.db') ? 'DuckDB database' : 
-                      attachment.name.endsWith('.csv') ? 'CSV file' : 'JSON file';
-      messageContent = `${input}\n\nI've uploaded a ${fileType} (${attachment.name}) with the following data:\n\`\`\`json\n${dataString}\n\`\`\`\n\nPlease create a bar graph from this data.`;
+      const fileType = duckdbAttachment ? 'DuckDB database' : 'CSV file';
+      messageContent = `${input}\n\nI've uploaded a ${fileType} (${attachment.name}) with the following data:\n\`\`\`json\n${dataString}\n\`\`\`\n`;
+    }
+
+    // For DuckDB files with column information only
+    if (duckdbColumns && duckdbAttachment && !parsedData) {
+      messageContent = `${input}\n\nI've uploaded a DuckDB database (${duckdbAttachment.name}) with the following columns:\n${duckdbColumns.join(', ')}`;
     }
 
     // For image attachments, we still need to handle them differently
@@ -153,9 +164,7 @@ export function MultimodalInput({
         };
         console.log("Sending message with image:", message);
         append(message, {});
-        setAttachment(undefined);
-        setParsedData(null);
-        setJsonSchema(null);
+        clearAttachments();
         setIsUploading(false);
       };
       reader.onerror = () => {
@@ -164,16 +173,14 @@ export function MultimodalInput({
       };
       reader.readAsDataURL(attachment);
     } else {
-      // For CSV files or no attachment, send as text message only
+      // For CSV/DuckDB files or no attachment, send as text message only
       const message = {
         role: "user" as const,
         content: messageContent,
       };
       console.log("Sending message:", message);
       append(message, {});
-      setAttachment(undefined);
-      setParsedData(null);
-      setJsonSchema(null);
+      clearAttachments();
     }
 
     setInput("");
@@ -187,112 +194,127 @@ export function MultimodalInput({
     setLocalStorageInput,
     width,
     attachment,
+    csvAttachment,
+    duckdbAttachment,
     append,
     input,
     setInput,
     parsedData,
+    duckdbColumns,
   ]);
 
-  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    setAttachment(file);
-    setIsGeneratingSchema(true);
-    setJsonSchema(null);
+  const clearAttachments = () => {
+    setCsvAttachment(undefined);
+    setDuckdbAttachment(undefined);
     setParsedData(null);
+    setJsonSchema(null);
+    setDuckdbColumns(null);
+  };
+
+  const handleCsvFileSelect = async (file: File) => {
+    // File type validation for CSV button
+    if (!file.name.endsWith('.csv') && file.type !== 'text/csv') {
+      toast.error("Please select a CSV file (.csv extension required)");
+      return;
+    }
+
+    // Clear any existing attachments
+    clearAttachments();
+    setCsvAttachment(file);
+    setIsGeneratingSchema(true);
 
     try {
-      if (file.type === "application/json") {
-        // Handle JSON files
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          try {
-            const text = e.target?.result as string;
-            const data = JSON.parse(text);
-            const schema = GenerateSchema.json(data);
-            setParsedData(Array.isArray(data) ? data : [data]);
-            setJsonSchema(schema);
-          } catch (error) {
-            toast.error("Invalid JSON file");
-            console.error("JSON parsing error:", error);
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const text = e.target?.result as string;
+          const parsedCsv = Papa.parse(text, { 
+            header: true, 
+            skipEmptyLines: true,
+            dynamicTyping: true
+          });
+          
+          if (parsedCsv.errors.length > 0) {
+            console.warn("CSV parsing warnings:", parsedCsv.errors);
           }
-          setIsGeneratingSchema(false);
-        };
-        reader.onerror = () => {
-          toast.error("Failed to read JSON file");
-          setIsGeneratingSchema(false);
-        };
-        reader.readAsText(file);
-      } 
-      else if (file.type === "text/csv" || file.name.endsWith('.csv')) {
-        // Handle CSV files
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          try {
-            const text = e.target?.result as string;
-            const parsedCsv = Papa.parse(text, { 
-              header: true, 
-              skipEmptyLines: true,
-              dynamicTyping: true
-            });
-            
-            if (parsedCsv.errors.length > 0) {
-              console.warn("CSV parsing warnings:", parsedCsv.errors);
-            }
-            
-            const data = parsedCsv.data;
-            const schema = GenerateSchema.json(data);
-            setParsedData(data);
-            setJsonSchema(schema);
-            
-            console.log("Parsed CSV data:", data);
-          } catch (error) {
-            toast.error("Failed to parse CSV file");
-            console.error("CSV parsing error:", error);
-          }
-          setIsGeneratingSchema(false);
-        };
-        reader.onerror = () => {
-          toast.error("Failed to read CSV file");
-          setIsGeneratingSchema(false);
-        };
-        reader.readAsText(file);
-      }
-      else if (file.name.endsWith('.duckdb') || file.name.endsWith('.db')) {
-        // Handle DuckDB files
-        await handleDuckDBFile(file);
-      }
-      else {
-        toast.error("Unsupported file type. Please upload CSV, JSON, or DuckDB files.");
-        setAttachment(undefined);
+          
+          const data = parsedCsv.data;
+          const schema = GenerateSchema.json(data);
+          setParsedData(data);
+          setJsonSchema(schema);
+          
+          console.log("Parsed CSV data:", data);
+          toast.success(`Successfully loaded ${data.length} rows from CSV file`);
+        } catch (error) {
+          toast.error("Failed to parse CSV file");
+          console.error("CSV parsing error:", error);
+          setCsvAttachment(undefined);
+        }
         setIsGeneratingSchema(false);
-      }
+      };
+      reader.onerror = () => {
+        toast.error("Failed to read CSV file");
+        setIsGeneratingSchema(false);
+        setCsvAttachment(undefined);
+      };
+      reader.readAsText(file);
     } catch (error) {
-      console.error("Error processing file:", error);
-      toast.error("Failed to process file.");
+      console.error("Error processing CSV file:", error);
+      toast.error("Failed to process CSV file.");
       setIsGeneratingSchema(false);
+      setCsvAttachment(undefined);
     }
   };
 
-  const handleDuckDBFile = async (file: File) => {
+  const handleDuckdbFileSelect = async (file: File) => {
+    // File type validation for DuckDB button
+    if (!file.name.endsWith('.duckdb') && !file.name.endsWith('.db')) {
+      toast.error("Please select a DuckDB file (.duckdb or .db extension required)");
+      return;
+    }
+
+    // Clear any existing attachments
+    clearAttachments();
+    setDuckdbAttachment(file);
+    setIsDuckdbUploading(true);
+
     try {
-      const result = await processDuckDBFile(file);
+      // Upload file to backend for processing
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const response = await fetch('/api/upload-duckdb', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Unknown error' }));
+        throw new Error(errorData.detail || `HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const result = await response.json();
       
-      // Generate schema and set data
-      const schema = GenerateSchema.json(result.data);
-      setParsedData(result.data);
-      setJsonSchema(schema);
+      if (result.status === 'error') {
+        throw new Error(result.error || 'Failed to process DuckDB file');
+      }
+
+      // Set the column information
+      setDuckdbColumns(result.columns);
       
-      toast.success(`Successfully loaded ${result.rowCount} rows from table "${result.tableName}"`);
+      toast.success(`Successfully processed DuckDB file: ${result.columns.length} columns found in table "${result.table_name}"`);
       
     } catch (error) {
-      console.error("DuckDB parsing error:", error);
-      toast.error(error instanceof Error ? error.message : "Failed to parse DuckDB file. Make sure it's a valid DuckDB database.");
+      console.error("Error processing DuckDB file:", error);
+      const errorMessage = error instanceof Error ? error.message : "Failed to process DuckDB file.";
+      toast.error(errorMessage);
+      setDuckdbAttachment(undefined);
     } finally {
-      setIsGeneratingSchema(false);
+      setIsDuckdbUploading(false);
     }
   };
+
+
 
   return (
     <div className="relative w-full flex flex-col gap-4">
@@ -335,41 +357,38 @@ export function MultimodalInput({
             url: URL.createObjectURL(attachment),
           }}
           setAttachment={(file) => {
-            setAttachment(file as File | undefined);
             if (!file) {
-              setParsedData(null);
-              setJsonSchema(null);
+              clearAttachments();
             }
           }}
-          isUploading={isUploading}
+          isUploading={isUploading || isDuckdbUploading}
           isGeneratingSchema={isGeneratingSchema}
           jsonSchema={jsonSchema}
+          duckdbColumns={duckdbColumns}
         />
       )}
 
       <div className="relative flex items-center">
-        <Button
-          className="rounded-full p-1.5 h-fit absolute left-2 m-0.5 border dark:border-zinc-600"
-          onClick={(event) => {
-            event.preventDefault();
-            fileInputRef.current?.click();
-          }}
-          disabled={isUploading}
-        >
-          <Paperclip className="w-4 h-4" />
-        </Button>
-
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".csv,.json,.duckdb,.db"
-          className="hidden"
-          onChange={handleFileChange}
-        />
+        <div className="absolute left-2 m-0.5 flex gap-1">
+          <AttachmentButton
+            fileType="csv"
+            onFileSelect={handleCsvFileSelect}
+            disabled={isUploading || isDuckdbUploading || isGeneratingSchema}
+            accept=".csv"
+            tooltip="Upload CSV file"
+          />
+          <AttachmentButton
+            fileType="duckdb"
+            onFileSelect={handleDuckdbFileSelect}
+            disabled={isUploading || isDuckdbUploading || isGeneratingSchema}
+            accept=".duckdb,.db"
+            tooltip="Upload DuckDB database file"
+          />
+        </div>
 
         <Textarea
           ref={textareaRef}
-          style={{ paddingLeft: "40px" }}
+          style={{ paddingLeft: "72px" }}
           placeholder="Send a message..."
           value={input}
           onChange={handleInput}
@@ -383,7 +402,7 @@ export function MultimodalInput({
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
 
-              if (isLoading || isUploading) {
+              if (isLoading || isUploading || isDuckdbUploading) {
                 toast.error("Please wait for the model to finish its response!");
               } else {
                 submitForm();
@@ -393,7 +412,7 @@ export function MultimodalInput({
         />
       </div>
 
-      {isLoading || isUploading ? (
+      {isLoading || isUploading || isDuckdbUploading ? (
         <Button
           className="rounded-full p-1.5 h-fit absolute bottom-2 right-2 m-0.5 border dark:border-zinc-600"
           onClick={(event) => {

@@ -9,12 +9,14 @@ export const PreviewAttachment = ({
   isUploading = false,
   isGeneratingSchema,
   jsonSchema,
+  duckdbColumns,
 }: {
   attachment: Attachment;
   setAttachment?: (file: undefined) => void;
   isUploading?: boolean;
   isGeneratingSchema?: boolean;
   jsonSchema?: any;
+  duckdbColumns?: string[] | null;
 }) => {
   const { name, url, contentType } = attachment;
 
@@ -53,13 +55,22 @@ export const PreviewAttachment = ({
               <LoaderIcon />
             </div>
           )}
-          {jsonSchema && !isGeneratingSchema && (
+          {(jsonSchema || duckdbColumns) && !isGeneratingSchema && !isUploading && (
             <div className="absolute text-zinc-500">
               <CheckIcon />
             </div>
           )}
         </div>
         <div className="text-xs text-zinc-500 max-w-16 truncate">{name}</div>
+        {duckdbColumns && (
+          <div className="text-xs text-zinc-600 max-w-32">
+            <div className="font-medium">Columns:</div>
+            <div className="truncate" title={duckdbColumns.join(', ')}>
+              {duckdbColumns.slice(0, 3).join(', ')}
+              {duckdbColumns.length > 3 && ` +${duckdbColumns.length - 3} more`}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

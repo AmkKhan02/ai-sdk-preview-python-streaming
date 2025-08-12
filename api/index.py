@@ -2,14 +2,17 @@ import os
 import json
 import uuid
 import logging
-from typing import List, Dict, Any  # Added Dict import here
+import tempfile
+from typing import List, Dict, Any
 from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Request as FastAPIRequest
+from fastapi import FastAPI, Query, Request as FastAPIRequest, File, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import google.generativeai as genai
 from .utils.prompt import ClientMessage, convert_to_gemini_messages
-from .utils.tools import get_current_weather, create_graph
+from .utils.tools import get_current_weather, create_graph, execute_analytical_query, execute_analytical_query_detailed, list_available_databases
+from .utils.process_duckdb import process_duckdb_file, DuckDBProcessingError, extract_clean_response
+from .utils.file_registry import file_registry
 
 load_dotenv(".env.local")
 
@@ -21,9 +24,26 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 class Request(BaseModel):
     messages: List[ClientMessage]
 
+class DuckDBProcessingResult(BaseModel):
+    columns: List[str]
+    table_name: str
+    all_tables: List[str]
+    file_size: int
+    status: str
+    db_path: str = None  # Path to the database file for analytical queries
+    error: str = None
+
+class AnalyticalQueryRequest(BaseModel):
+    question: str
+    db_path: str
+    session_id: str = None
+
 available_tools = {
     "get_current_weather": get_current_weather,
     "create_graph": create_graph,
+    "execute_analytical_query": execute_analytical_query,
+    "execute_analytical_query_detailed": execute_analytical_query_detailed,
+    "list_available_databases": list_available_databases,
 }
 
 def to_serializable(obj):
@@ -107,18 +127,96 @@ gemini_tools = [
                     },
                     "required": ["data", "graph_type"],
                 },
+            },
+            {
+                "name": "execute_analytical_query",
+                "description": "Execute analytical queries against uploaded DuckDB databases to answer data questions",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The analytical question to answer using the database",
+                        },
+                        "db_path": {
+                            "type": "string",
+                            "description": "Path to the DuckDB database file (use the path from the upload response)",
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Optional session ID for follow-up queries to maintain context",
+                        },
+                    },
+                    "required": ["question", "db_path"],
+                },
+            },
+            {
+                "name": "list_available_databases",
+                "description": "List all available DuckDB databases that have been uploaded and can be used for analysis",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
             }
         ]
     }
 ]
+
 def stream_text(messages_data: Dict, protocol: str = 'data'):
     try:
         logging.info(f"Data sent to Gemini: {messages_data}")
+        
+        # Default system instruction for analytical capabilities
+        default_system_instruction = """You are an AI assistant with advanced data analysis capabilities. 
+
+When users upload DuckDB database files, you can analyze them using the execute_analytical_query tool. This tool:
+- Automatically generates and executes SQL queries based on the user's question
+- Uses AI to create a natural language response with insights
+- Returns only the essential answer without exposing technical details
+- Handles follow-up questions using session context
+
+IMPORTANT: When a user asks questions about their uploaded data:
+
+1. If you don't know what databases are available, use the list_available_databases tool first to see what files have been uploaded.
+
+2. Use the execute_analytical_query tool with:
+   - question: The user's question about the data
+   - db_path: You can use either the full database path OR just the filename (e.g., "leads_data.duckdb")
+   - session_id: Optional, for follow-up queries to maintain context
+
+The tool will automatically:
+- Extract database schema information
+- Generate appropriate SQL queries using AI
+- Execute the queries against the database
+- Generate a comprehensive natural language response
+
+You can answer questions like:
+- "Describe the data I've uploaded"
+- "What is the most common marketing source?"
+- "How many leads converted to deals?"
+- "What's the average time from form submission to deal closure?"
+- "Show me conversion rates by industry"
+
+The tool returns a clean response with just the answer. You should present this answer directly to the user as your analysis of their data.
+
+If no databases are available, ask the user to upload their DuckDB file first.
+
+Always use the analytical query tool when users ask questions about their uploaded database data."""
+
+        # Use provided system instruction or default
+        system_instruction = messages_data.get("system_instruction")
+        if system_instruction:
+            # Combine with default instruction
+            combined_instruction = f"{default_system_instruction}\n\nAdditional instructions:\n{system_instruction}"
+        else:
+            combined_instruction = default_system_instruction
+        
         # Initialize the model
         model = genai.GenerativeModel(
             model_name="gemini-1.5-flash",
             tools=gemini_tools,
-            system_instruction=messages_data.get("system_instruction")
+            system_instruction=combined_instruction
         )
 
         # Start chat with history
@@ -141,7 +239,9 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
 
         # Track function calls to avoid duplicates
         processed_function_calls = set()
+        function_responses = []
 
+        # First pass: collect all function calls and execute them
         for chunk in response:
             logging.info(f"Raw response from Gemini: {chunk}")
             # Handle text content
@@ -181,32 +281,221 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
                                     result = available_tools[function_call.name](**args)
                                     logging.info(f"Tool result: {result}")
                                     
-                                    # Yield tool result
-                                    yield f'a:{{"toolCallId":"{tool_call_id}","toolName":"{function_call.name}","args":{json.dumps(args)},"result":{json.dumps(result)}}}\n'
+                                    # For analytical query functions, extract clean response
+                                    if function_call.name in ['execute_analytical_query', 'execute_analytical_query_detailed']:
+                                        clean_result = extract_clean_response(result)
+                                        # Create a clean response structure for the model
+                                        model_result = {
+                                            "success": result.get('success', False),
+                                            "answer": clean_result,
+                                            "session_id": result.get('session_id', 'unknown')
+                                        }
+                                    else:
+                                        model_result = result
                                     
-                                    # Send function response back to model and get final response
-                                    function_response = {
+                                    # Yield tool result (this goes to the UI)
+                                    yield f'a:{{"toolCallId":"{tool_call_id}","toolName":"{function_call.name}","args":{json.dumps(args)},"result":{json.dumps(model_result)}}}\n'
+                                    
+                                    # Store function response for sending back to model
+                                    function_responses.append({
                                         "function_response": {
                                             "name": function_call.name,
-                                            "response": result
+                                            "response": model_result
                                         }
-                                    }
-                                    
-                                    # Break out of the loop to avoid processing more chunks
-                                    # that might trigger the same function call again
-                                    break
-                                            
+                                    })
+                                                                        
                                 except Exception as e:
                                     error_result = {"error": str(e)}
                                     yield f'a:{{"toolCallId":"{tool_call_id}","toolName":"{function_call.name}","args":{json.dumps(args)},"result":{json.dumps(error_result)}}}\n'
+                                    
+                                    # Store error response
+                                    function_responses.append({
+                                        "function_response": {
+                                            "name": function_call.name,
+                                            "response": error_result
+                                        }
+                                    })
 
-        # End stream
-        yield 'e:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0},"isContinued":false}\n'
+        # If we have function responses, send them all back to the model in one go
+        if function_responses:
+            # Extract clean answers from function responses
+            clean_parts = []
+            
+            for func_resp in function_responses:
+                if 'function_response' in func_resp:
+                    response_data = func_resp['function_response']['response']
+                    
+                    # For analytical queries, use just the answer
+                    if func_resp['function_response']['name'] in ['execute_analytical_query', 'execute_analytical_query_detailed']:
+                        if isinstance(response_data, dict) and 'answer' in response_data:
+                            clean_parts.append(response_data['answer'])
+                        else:
+                            clean_parts.append(str(response_data))
+                    else:
+                        # For other functions, convert to string
+                        clean_parts.append(str(response_data))
+            
+            consolidated_response = {
+                "parts": clean_parts + ["Based on the analysis above, provide a natural language response to the user. Do not include any JSON, code blocks, or structured data."]
+            }
+            
+            logging.info(f"Sending consolidated function responses to model: {len(function_responses)} responses")
+            logging.info(f"Consolidated response structure: {consolidated_response}")
+            
+            # Send all function responses back to the model for a final, consolidated response
+            final_response = chat.send_message(
+                consolidated_response,
+                stream=True,
+            )
+            
+            # Stream the final text response from the model
+            for chunk in final_response:
+                if hasattr(chunk, 'text') and chunk.text:
+                    yield f'0:{json.dumps(chunk.text)}\n'
+            
+            # After streaming the final response, end the stream
+            yield 'e:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0},"isContinued":false}\n'
+        else:
+            # If there were no function calls, end the stream now
+            yield 'e:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0},"isContinued":false}\n'
 
     except Exception as e:
         # Handle errors
+        logging.error(f"An error occurred in stream_text: {str(e)}")
         yield f'0:{json.dumps(f"Error: {str(e)}")}\n'
         yield 'e:{"finishReason":"error","usage":{"promptTokens":0,"completionTokens":0},"isContinued":false}\n'
+        
+@app.post("/api/upload-duckdb")
+async def upload_duckdb_file(file: UploadFile = File(...)):
+    """
+    Upload and process a DuckDB file to extract column information.
+    
+    Args:
+        file: The uploaded DuckDB file
+        
+    Returns:
+        JSON response with column information and processing status
+        
+    Raises:
+        HTTPException: For various error conditions
+    """
+    # File size validation (10MB limit)
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
+    
+    # Validate file extension
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    
+    allowed_extensions = ['.duckdb', '.db']
+    file_extension = os.path.splitext(file.filename.lower())[1]
+    if file_extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid file type. Only {', '.join(allowed_extensions)} files are allowed"
+        )
+    
+    # Create temporary file
+    temp_file_path = None
+    try:
+        # Read file content
+        file_content = await file.read()
+        
+        # Validate file size
+        if len(file_content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413, 
+                detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB"
+            )
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+            temp_file.write(file_content)
+            temp_file_path = temp_file.name
+        
+        # Process the DuckDB file
+        try:
+            logging.info(f"Processing DuckDB file: {temp_file_path}, size: {len(file_content)} bytes")
+            result = process_duckdb_file(temp_file_path, cleanup=False)
+            logging.info(f"DuckDB processing result: {result}")
+            
+            if result['status'] == 'error':
+                raise HTTPException(
+                    status_code=422, 
+                    detail=f"Failed to process DuckDB file: {result.get('error', 'Unknown error')}"
+                )
+            
+            # Register file in the registry for analytical queries
+            try:
+                file_id = file_registry.register_file(
+                    filename=file.filename,
+                    db_path=result['db_path'],
+                    metadata=result
+                )
+                logging.info(f"Registered file in registry: {file_id}")
+            except Exception as e:
+                logging.warning(f"Failed to register file in registry: {e}")
+            
+            # Return successful response
+            return DuckDBProcessingResult(**result)
+            
+        except DuckDBProcessingError as e:
+            raise HTTPException(status_code=422, detail=f"DuckDB processing error: {str(e)}")
+        except Exception as e:
+            logging.error(f"Unexpected error processing DuckDB file: {str(e)}")
+            raise HTTPException(status_code=500, detail="Internal server error during file processing")
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error in upload endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        # Note: We don't cleanup the temporary file here as it needs to persist
+        # for analytical queries. The session manager will handle cleanup when sessions expire.
+        pass
+
+@app.post("/api/analyze-duckdb")
+async def analyze_duckdb(request: AnalyticalQueryRequest):
+    """
+    Execute analytical queries against DuckDB databases with clean text responses.
+    
+    This endpoint provides analytical results with only clean text responses,
+    never exposing JSON structure to users.
+    
+    Args:
+        request: AnalyticalQueryRequest containing question, db_path, and optional session_id
+        
+    Returns:
+        JSON response with clean text answer only
+        
+    Raises:
+        HTTPException: For various error conditions
+    """
+    try:
+        # Execute the detailed analytical query
+        result = execute_analytical_query_detailed(
+            question=request.question,
+            db_path=request.db_path,
+            session_id=request.session_id
+        )
+        
+        if not result.get('success', False):
+            # Return clean error message, not JSON structure
+            error_message = result.get('error', 'Analytical query failed')
+            return {"response": f"I encountered an error while analyzing your data: {error_message}"}
+        
+        # Extract and return only the clean answer text
+        clean_answer = extract_clean_response(result)
+        return {"response": clean_answer}
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error in analyze-duckdb endpoint: {str(e)}")
+        # Return clean error message, not technical details
+        return {"response": "I encountered an unexpected error while analyzing your data. Please try again or contact support if the issue persists."}
 
 @app.post("/api/chat")
 async def handle_chat_data(request: FastAPIRequest, protocol: str = Query('data')):

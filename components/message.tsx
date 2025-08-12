@@ -37,7 +37,7 @@ export const PreviewMessage = ({
 
         <div className="flex flex-col gap-2 w-full">
           {message.content && (
-            <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-4 overflow-x-auto">
               <Markdown>{message.content as string}</Markdown>
             </div>
           )}
@@ -51,7 +51,7 @@ export const PreviewMessage = ({
                   const { result } = toolInvocation;
 
                   return (
-                    <div key={toolCallId}>
+                    <div key={toolCallId} className="overflow-x-auto">
                       {toolName === "get_current_weather" ? (
                         <Weather weatherAtLocation={result} />
                       ) : toolName === "create_graph" ? (
