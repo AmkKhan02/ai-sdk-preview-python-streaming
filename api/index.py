@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query, Request as FastAPIRequest, File, UploadFile,
 from fastapi.responses import StreamingResponse, JSONResponse
 import google.generativeai as genai
 from .utils.prompt import ClientMessage, convert_to_gemini_messages
-from .utils.tools import get_current_weather, create_graph, execute_analytical_query, execute_analytical_query_detailed, list_available_databases
+from .utils.tools import get_current_weather, create_graph, execute_analytical_query, execute_analytical_query_detailed, list_available_databases, create_graph_from_duckdb
 from .utils.process_duckdb import process_duckdb_file, DuckDBProcessingError, extract_clean_response
 from .utils.file_registry import file_registry
 
@@ -44,6 +44,7 @@ available_tools = {
     "execute_analytical_query": execute_analytical_query,
     "execute_analytical_query_detailed": execute_analytical_query_detailed,
     "list_available_databases": list_available_databases,
+    "create_graph_from_duckdb": create_graph_from_duckdb,
 }
 
 def to_serializable(obj):
@@ -158,6 +159,41 @@ gemini_tools = [
                     "properties": {},
                     "required": [],
                 },
+            },
+            {
+                "name": "create_graph_from_duckdb",
+                "description": "Create a graph/chart from DuckDB data using natural language requests. Uses AI to generate appropriate SQL queries and create visualizations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "natural_language_request": {
+                            "type": "string",
+                            "description": "Natural language description of what to visualize (e.g., 'Show me sales by month', 'Compare revenue across regions')",
+                        },
+                        "db_path": {
+                            "type": "string",
+                            "description": "Path to the DuckDB database file",
+                        },
+                        "graph_type": {
+                            "type": "string",
+                            "description": "Type of graph to generate: 'bar', 'line', 'scatter', or 'pie'",
+                            "enum": ["bar", "line", "scatter", "pie"]
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Title for the graph",
+                        },
+                        "x_label": {
+                            "type": "string",
+                            "description": "Label for the x-axis",
+                        },
+                        "y_label": {
+                            "type": "string",
+                            "description": "Label for the y-axis",
+                        },
+                    },
+                    "required": ["natural_language_request", "db_path"],
+                },
             }
         ]
     }
@@ -170,40 +206,54 @@ def stream_text(messages_data: Dict, protocol: str = 'data'):
         # Default system instruction for analytical capabilities
         default_system_instruction = """You are an AI assistant with advanced data analysis capabilities. 
 
-When users upload DuckDB database files, you can analyze them using the execute_analytical_query tool. This tool:
+When users upload DuckDB database files, you can analyze them using the execute_analytical_query tool and create visualizations using the create_graph_from_duckdb tool.
+
+ANALYTICAL QUERIES:
+The execute_analytical_query tool:
 - Automatically generates and executes SQL queries based on the user's question
 - Uses AI to create a natural language response with insights
 - Returns only the essential answer without exposing technical details
 - Handles follow-up questions using session context
 - Ensures DuckDB-compatible SQL syntax (uses 'julian' function instead of 'JULIANDAY')
 
+GRAPH GENERATION:
+The create_graph_from_duckdb tool:
+- Creates charts and graphs from DuckDB data using natural language requests
+- Automatically generates appropriate SQL queries for visualization data
+- Supports bar charts, line charts, scatter plots, and pie charts
+- Returns base64-encoded images that are automatically displayed
+
 IMPORTANT: When a user asks questions about their uploaded data:
 
 1. If you don't know what databases are available, use the list_available_databases tool first to see what files have been uploaded.
 
-2. Use the execute_analytical_query tool with:
+2. For data analysis, use the execute_analytical_query tool with:
    - question: The user's question about the data
    - db_path: You can use either the full database path OR just the filename (e.g., "leads_data.duckdb")
    - session_id: Optional, for follow-up queries to maintain context
 
-The tool will automatically:
+3. For visualizations, use the create_graph_from_duckdb tool with:
+   - natural_language_request: Description of what to visualize (e.g., "Show sales by month", "Compare revenue by region")
+   - db_path: Path to the DuckDB database file
+   - graph_type: Type of chart ("bar", "line", "scatter", "pie")
+   - title, x_label, y_label: Optional labels for the chart
+
+The tools will automatically:
 - Extract database schema information
 - Generate appropriate SQL queries using AI (with DuckDB-compatible syntax)
 - Execute the queries against the database
-- Generate a comprehensive natural language response
+- Generate comprehensive responses or visualizations
 
 You can answer questions like:
 - "Describe the data I've uploaded"
 - "What is the most common marketing source?"
-- "How many leads converted to deals?"
-- "What's the average time from form submission to deal closure?"
-- "Show me conversion rates by industry"
-
-The tool returns a clean response with just the answer. You should present this answer directly to the user as your analysis of their data.
+- "Show me a bar chart of sales by month"
+- "Create a pie chart of leads by industry"
+- "Graph the conversion rates over time"
 
 If no databases are available, ask the user to upload their DuckDB file first.
 
-Always use the analytical query tool when users ask questions about their uploaded database data."""
+Always use the appropriate tool when users ask questions about their uploaded database data or request visualizations."""
 
         # Use provided system instruction or default
         system_instruction = messages_data.get("system_instruction")

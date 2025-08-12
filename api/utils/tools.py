@@ -140,6 +140,189 @@ def create_graph(data: list, graph_type: str, title: str = "Graph", x_label: str
         return {"error": f"Error creating graph: {str(e)}"}
 
 
+def create_graph_from_duckdb(natural_language_request: str, db_path: str, graph_type: str = "bar", title: str = "Graph", x_label: str = "X-axis", y_label: str = "Y-axis"):
+    """
+    Generates a graph from DuckDB data using natural language requests.
+    
+    This function uses Gemini AI to convert natural language requests into SQL queries,
+    executes them against a DuckDB database, and creates visualizations.
+    
+    Args:
+        natural_language_request: User's natural language description of what to visualize
+        db_path: Path to the DuckDB database file
+        graph_type: Type of graph to generate ('bar', 'line', 'scatter', 'pie')
+        title: Title for the graph
+        x_label: Label for the x-axis
+        y_label: Label for the y-axis
+        
+    Returns:
+        Dictionary containing either the base64-encoded image or error message
+    """
+    try:
+        # If db_path looks like just a filename, try to find it in the registry or api directory
+        if not os.path.isabs(db_path) and not os.path.exists(db_path):
+            file_info = file_registry.get_file_info(db_path)
+            if file_info:
+                db_path = file_info['db_path']
+                logging.info(f"Found database in registry: {db_path}")
+            else:
+                # Try looking in the api directory as a fallback
+                api_path = os.path.join("api", db_path)
+                if os.path.exists(api_path):
+                    db_path = api_path
+                    logging.info(f"Found database in api directory: {db_path}")
+                else:
+                    return {"error": f"Database file '{db_path}' not found. Please upload the DuckDB file first."}
+        
+        # First, get the database schema information
+        try:
+            schema_info = get_table_info(db_path)
+        except Exception as e:
+            return {"error": f"Failed to get database schema: {str(e)}"}
+        
+        # Create a prompt specifically for graph data generation
+        graph_prompt = f"""
+        I need to create a {graph_type} chart. {natural_language_request}
+        
+        Please generate SQL queries that will return data suitable for visualization.
+        The data should have:
+        - A column for the x-axis (categories, labels, or time values)
+        - A column for the y-axis (numeric values to plot)
+        
+        Return data that can be easily plotted in a {graph_type} chart.
+        """
+        
+        # Generate SQL queries using Gemini AI
+        try:
+            sql_queries = get_sql_queries(graph_prompt, schema_info)
+        except Exception as e:
+            return {"error": f"Failed to generate SQL queries: {str(e)}"}
+        
+        if not sql_queries:
+            return {"error": "No SQL queries were generated"}
+        
+        # Execute the SQL queries
+        try:
+            query_results = execute_sql_queries(sql_queries, db_path, result_format="df")
+        except Exception as e:
+            return {"error": f"Failed to execute SQL queries: {str(e)}"}
+        
+        # Find the query result with data
+        data_result = None
+        for result in query_results:
+            if result.get("success", False) and result.get("data") and len(result["data"]) > 0:
+                data_result = result
+                break
+        
+        if not data_result:
+            return {"error": "No data returned from queries"}
+        
+        # Convert the data to a format suitable for plotting
+        data = data_result["data"]
+        
+        # Ensure data is in the correct format (list of dictionaries)
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            try:
+                # Attempt to convert if it's a different but compatible format
+                data = [dict(item) for item in data]
+            except (TypeError, ValueError):
+                return {"error": "Invalid data format. Expected a list of dictionaries."}
+
+        df = pd.DataFrame(data)
+        
+        if df.empty:
+            return {"error": "Data is empty"}
+
+        # Set up the plot
+        plt.figure(figsize=(12, 8))
+        
+        # Determine x and y columns
+        columns = df.columns.tolist()
+        
+        if len(columns) < 1:
+            return {"error": "Data must have at least 1 column"}
+        
+        # Try to identify x and y columns intelligently
+        x_col = None
+        y_col = None
+        
+        # For pie charts, we need different logic
+        if graph_type == 'pie':
+            # Find a categorical column and a numeric column
+            for col in columns:
+                if df[col].dtype in ['object', 'string'] or col.lower() in ['label', 'name', 'category', 'type']:
+                    x_col = col
+                elif pd.api.types.is_numeric_dtype(df[col]) and col.lower() in ['value', 'amount', 'count', 'size']:
+                    y_col = col
+        else:
+            # For other charts, use the existing logic
+            for col in columns:
+                if df[col].dtype in ['object', 'string'] or col.lower() in ['label', 'name', 'category', 'month', 'date', 'time']:
+                    x_col = col
+                elif pd.api.types.is_numeric_dtype(df[col]) and col.lower() in ['value', 'amount', 'count', 'price', 'total']:
+                    y_col = col
+        
+        # Fallback logic
+        if x_col is None and len(columns) >= 1:
+            x_col = columns[0]
+        if y_col is None and len(columns) >= 2:
+            # Find first numeric column
+            for col in columns:
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    y_col = col
+                    break
+            if y_col is None:
+                y_col = columns[1]  # Fallback to second column
+        
+        # Handle single column case for pie charts
+        if graph_type == 'pie' and y_col is None and len(columns) == 1:
+            # Count occurrences of values in the single column
+            value_counts = df[x_col].value_counts()
+            plt.pie(value_counts.values, labels=value_counts.index, autopct='%1.1f%%')
+            plt.title(title)
+        else:
+            # Create the plot based on graph type
+            if graph_type == 'bar':
+                plt.bar(df[x_col], df[y_col])
+                plt.xticks(rotation=45, ha='right')
+            elif graph_type == 'line':
+                plt.plot(df[x_col], df[y_col], marker='o')
+                plt.xticks(rotation=45, ha='right')
+            elif graph_type == 'scatter':
+                plt.scatter(df[x_col], df[y_col])
+                plt.xticks(rotation=45, ha='right')
+            elif graph_type == 'pie':
+                if y_col:
+                    plt.pie(df[y_col], labels=df[x_col], autopct='%1.1f%%')
+                else:
+                    return {"error": "Pie chart requires a numeric column for values"}
+            else:
+                return {"error": f"Unsupported graph type: {graph_type}. Supported types: 'bar', 'line', 'scatter', 'pie'"}
+
+            # Add labels and title (except for pie charts which don't use axis labels)
+            if graph_type != 'pie':
+                plt.xlabel(x_label)
+                plt.ylabel(y_label)
+            plt.title(title)
+        
+        plt.tight_layout()
+        
+        # Save to base64
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        buf.seek(0)
+        
+        image_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        
+        plt.close()  # Important: close the figure to free memory
+        
+        return {"image": image_base64}
+
+    except Exception as e:
+        plt.close()  # Make sure to close the figure even if there's an error
+        return {"error": f"Error creating graph from DuckDB: {str(e)}"}
+
+
 def execute_analytical_query_detailed(question: str, db_path: str, session_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Execute analytical queries against DuckDB databases with detailed results.

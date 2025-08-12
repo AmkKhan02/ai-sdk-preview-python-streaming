@@ -56,6 +56,8 @@ export const PreviewMessage = ({
                         <Weather weatherAtLocation={result} />
                       ) : toolName === "create_graph" ? (
                         <Graph graphData={result} />
+                      ) : toolName === "create_graph_from_duckdb" ? (
+                        <Graph graphData={result} />
                       ) : (
                         <pre>{JSON.stringify(result, null, 2)}</pre>
                       )}
@@ -66,10 +68,10 @@ export const PreviewMessage = ({
                   <div
                     key={toolCallId}
                     className={cn({
-                      skeleton: ["get_current_weather", "create_graph"].includes(toolName),
+                      skeleton: ["get_current_weather", "create_graph", "create_graph_from_duckdb"].includes(toolName),
                     })}
                   >
-                    {toolName === "get_current_weather" ? <Weather /> : toolName === "create_graph" ? <div className="skeleton w-full h-64" /> : null}
+                    {toolName === "get_current_weather" ? <Weather /> : toolName === "create_graph" || toolName === "create_graph_from_duckdb" ? <div className="skeleton w-full h-64" /> : null}
                   </div>
                 );
               })}
