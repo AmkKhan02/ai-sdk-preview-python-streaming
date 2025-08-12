@@ -386,7 +386,7 @@ def get_sql_queries(user_prompt: str, columns_info: dict) -> List[str]:
         genai.configure(api_key=api_key)
         
         # Create the model
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-pro')
         
         # Format schema information for the prompt
         schema_text = _format_schema_for_prompt(columns_info)
@@ -431,7 +431,7 @@ Only return the JSON array, no additional text or explanation."""
             prompt,
             safety_settings=safety_settings,
             generation_config=genai.types.GenerationConfig(
-                temperature=0.1,  # Low temperature for more consistent SQL generation
+                temperature=0.0,  # Set to 0 for completely deterministic SQL generation
                 max_output_tokens=2048,
             )
         )
@@ -605,7 +605,7 @@ def generate_response(user_prompt: str, sql_queries: List[str], query_results: L
         genai.configure(api_key=api_key)
         
         # Create the model
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-pro')
         
         # Format query results for the prompt
         results_text = _format_query_results_for_prompt(sql_queries, query_results)
@@ -645,7 +645,7 @@ Generate a comprehensive but concise response that directly answers the user's q
             prompt,
             safety_settings=safety_settings,
             generation_config=genai.types.GenerationConfig(
-                temperature=0.3,  # Slightly higher temperature for more natural responses
+                temperature=0.0,  # Set to 0 for completely deterministic response generation
                 max_output_tokens=1024,
             )
         )

@@ -12,6 +12,7 @@ from datetime import datetime, date
 from .process_duckdb import get_sql_queries, execute_sql_queries, generate_response, get_table_info
 from .db_session import session_manager
 from .file_registry import file_registry
+from .query_cache import query_cache
 
 
 def ensure_json_serializable(obj):
@@ -487,10 +488,12 @@ def execute_analytical_query(question: str, db_path: str, session_id: Optional[s
     Execute analytical queries against DuckDB databases to answer data questions.
     
     This function provides a complete analytical workflow:
-    1. Extracts database schema information
-    2. Generates SQL queries using AI based on the question
-    3. Executes the queries against the database
-    4. Generates a natural language response with insights
+    1. Checks cache for identical questions
+    2. Extracts database schema information
+    3. Generates SQL queries using AI based on the question
+    4. Executes the queries against the database
+    5. Generates a natural language response with insights
+    6. Caches the result for future identical questions
     
     Args:
         question: The analytical question to answer
@@ -508,6 +511,12 @@ def execute_analytical_query(question: str, db_path: str, session_id: Optional[s
     """
     try:
         logging.info(f"Executing analytical query: {question[:100]}...")
+        
+        # Check cache first for identical questions
+        cached_result = query_cache.get(question, db_path)
+        if cached_result is not None:
+            logging.info("Returning cached result for identical question")
+            return cached_result
         
         # If db_path looks like just a filename, try to find it in the registry
         if not os.path.isabs(db_path) and not os.path.exists(db_path):
@@ -610,8 +619,11 @@ def execute_analytical_query(question: str, db_path: str, session_id: Optional[s
             "error": None
         }
         
-        # Ensure the result is JSON serializable
-        return ensure_json_serializable(result)
+        # Cache successful results for future identical questions
+        final_result = ensure_json_serializable(result)
+        query_cache.put(question, db_path, final_result)
+        
+        return final_result
         
     except Exception as e:
         logging.error(f"Unexpected error in execute_analytical_query: {str(e)}")

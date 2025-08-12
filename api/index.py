@@ -265,7 +265,7 @@ Always use the appropriate tool when users ask questions about their uploaded da
         
         # Initialize the model
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.5-pro",
             tools=gemini_tools,
             system_instruction=combined_instruction
         )
