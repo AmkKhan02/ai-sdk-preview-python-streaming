@@ -81,6 +81,7 @@ export function MultimodalInput({
   const [isGeneratingSchema, setIsGeneratingSchema] = useState(false);
   const [duckdbColumns, setDuckdbColumns] = useState<string[] | null>(null);
   const [isDuckdbUploading, setIsDuckdbUploading] = useState(false);
+  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
   
   // Get the current attachment (either CSV or DuckDB)
   const attachment = csvAttachment || duckdbAttachment;
@@ -163,7 +164,11 @@ export function MultimodalInput({
           ],
         };
         console.log("Sending message with image:", message);
-        append(message, {});
+        append(message, {
+          body: {
+            webSearchEnabled
+          }
+        });
         clearAttachments();
         setIsUploading(false);
       };
@@ -179,7 +184,11 @@ export function MultimodalInput({
         content: messageContent,
       };
       console.log("Sending message:", message);
-      append(message, {});
+      append(message, {
+        body: {
+          webSearchEnabled
+        }
+      });
       clearAttachments();
     }
 
@@ -384,11 +393,41 @@ export function MultimodalInput({
             accept=".duckdb,.db"
             tooltip="Upload DuckDB database file"
           />
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            onClick={(event) => {
+              event.preventDefault();
+              setWebSearchEnabled(!webSearchEnabled);
+            }}
+            className={cn(
+              "rounded-full p-1.5 h-fit border dark:border-zinc-600 transition-colors duration-200",
+              webSearchEnabled 
+                ? "bg-orange-50 border-orange-200 text-orange-700 hover:bg-orange-100 hover:border-orange-300 dark:bg-orange-950 dark:border-orange-800 dark:text-orange-300 dark:hover:bg-orange-900 dark:hover:border-orange-700" 
+                : "hover:bg-orange-50 hover:border-orange-200 hover:text-orange-700 dark:hover:bg-orange-950 dark:hover:border-orange-800 dark:hover:text-orange-300"
+            )}
+            title={webSearchEnabled ? "Disable web search" : "Enable web search"}
+          >
+            <svg 
+              width="16" 
+              height="16" 
+              viewBox="0 0 24 24" 
+              fill="none" 
+              xmlns="http://www.w3.org/2000/svg"
+              className="w-4 h-4"
+            >
+              <circle cx="11" cy="11" r="8" stroke="currentColor" strokeWidth="2"/>
+              <path d="M21 21L16.5 16.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+              <path d="M11 6C13.5 8.5 13.5 13.5 11 16" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+              <path d="M6 11H16" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+            </svg>
+          </Button>
         </div>
 
         <Textarea
           ref={textareaRef}
-          style={{ paddingLeft: "72px" }}
+          style={{ paddingLeft: "144px" }}
           placeholder="Send a message..."
           value={input}
           onChange={handleInput}

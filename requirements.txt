@@ -39,3 +39,4 @@ matplotlib
 plotly
 pandas
 duckdb
+tavily-python==0.5.0

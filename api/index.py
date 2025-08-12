@@ -13,8 +13,14 @@ from .utils.prompt import ClientMessage, convert_to_gemini_messages
 from .utils.tools import get_current_weather, create_graph, execute_analytical_query, execute_analytical_query_detailed, list_available_databases, create_graph_from_duckdb
 from .utils.process_duckdb import process_duckdb_file, DuckDBProcessingError, extract_clean_response
 from .utils.file_registry import file_registry
+from .utils.web_search_llm import generate_web_search_query, answer_web_search_question
+from .utils.search_web import search_web
+from .utils.generate_examples import generate_specific_examples
 
 load_dotenv(".env.local")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 app = FastAPI()
 
@@ -23,6 +29,7 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 class Request(BaseModel):
     messages: List[ClientMessage]
+    webSearchEnabled: bool = False
 
 class DuckDBProcessingResult(BaseModel):
     columns: List[str]
@@ -199,7 +206,7 @@ gemini_tools = [
     }
 ]
 
-def stream_text(messages_data: Dict, protocol: str = 'data'):
+def stream_text(messages_data: Dict, protocol: str = 'data', web_search_enabled: bool = False):
     try:
         logging.info(f"Data sent to Gemini: {messages_data}")
         
@@ -255,6 +262,41 @@ If no databases are available, ask the user to upload their DuckDB file first.
 
 Always use the appropriate tool when users ask questions about their uploaded database data or request visualizations."""
 
+        # Handle web search if enabled
+        web_search_results = None
+        current_user_message = ""
+        
+        if web_search_enabled:
+            # Extract the current user message
+            contents = messages_data.get("contents", [])
+            if contents:
+                last_message = contents[-1]
+                if last_message.get("role") == "user" and last_message.get("parts"):
+                    current_user_message = last_message["parts"][0].get("text", "")
+                    
+                    if current_user_message.strip():
+                        try:
+                            # Generate web search query
+                            logging.info(f"Web search enabled. Generating search query for: {current_user_message}")
+                            search_query = generate_web_search_query(current_user_message)
+                            
+                            # Perform web search
+                            logging.info(f"Performing web search with query: {search_query}")
+                            web_search_results = search_web(search_query)
+                            
+                            # Generate answer based on web search results
+                            web_answer = answer_web_search_question(current_user_message, web_search_results)
+                            
+                            # Yield the web search answer first
+                            yield f'0:{json.dumps(f"Web Search Results:\n\n{web_answer}\n\n")}\n'
+                            
+                        except Exception as e:
+                            logging.error(f"Web search error: {str(e)}")
+                            if "TAVILY_API_KEY" in str(e):
+                                yield f'0:{json.dumps("⚠️ Web Search Error: Tavily API key not configured. Please add your TAVILY_API_KEY to your .env.local file to enable web search functionality. Proceeding with standard response.\n\n")}\n'
+                            else:
+                                yield f'0:{json.dumps(f"⚠️ Web search encountered an error: {str(e)}. Proceeding with standard response.\n\n")}\n'
+
         # Use provided system instruction or default
         system_instruction = messages_data.get("system_instruction")
         if system_instruction:
@@ -265,7 +307,7 @@ Always use the appropriate tool when users ask questions about their uploaded da
         
         # Initialize the model
         model = genai.GenerativeModel(
-            model_name="gemini-2.5-pro",
+            model_name="gemini-2.5-flash-lite",
             tools=gemini_tools,
             system_instruction=combined_instruction
         )
@@ -281,6 +323,20 @@ Always use the appropriate tool when users ask questions about their uploaded da
         else:
             chat = model.start_chat()
             current_message = contents[0]["parts"][0]["text"] if contents else ""
+            
+        # If web search was performed and no web search results were already yielded (due to error),
+        # and we want to continue with normal LLM processing, we can augment the message with web context
+        if web_search_enabled and web_search_results and current_user_message:
+            # Enhance the message with web search context for LLM processing
+            enhanced_message = f"""
+User Question: {current_user_message}
+
+Web Search Context (use this to provide more comprehensive answers):
+{web_search_results}
+
+Please provide a comprehensive response that combines your knowledge with the web search information above.
+"""
+            current_message = enhanced_message
 
         # Generate streaming response
         response = chat.send_message(
@@ -399,14 +455,74 @@ Always use the appropriate tool when users ask questions about their uploaded da
                 stream=True,
             )
             
+            # Collect the final response text for footnote generation
+            final_response_text = ""
+            
             # Stream the final text response from the model
             for chunk in final_response:
                 if hasattr(chunk, 'text') and chunk.text:
+                    final_response_text += chunk.text
                     yield f'0:{json.dumps(chunk.text)}\n'
+            
+            # Generate and append footnotes if we have analytical results
+            if final_response_text and function_responses:
+                # Check if any function responses were analytical or graph-related
+                analytical_functions = [
+                    'execute_analytical_query', 
+                    'execute_analytical_query_detailed', 
+                    'create_graph_from_duckdb'
+                ]
+                
+                has_data_analysis = any(
+                    resp.get('function_response', {}).get('name') in analytical_functions
+                    for resp in function_responses
+                )
+                
+                logging.info(f"🔍 Checking for footnote generation trigger:")
+                logging.info(f"   Final response text length: {len(final_response_text)}")
+                logging.info(f"   Function responses: {len(function_responses)}")
+                logging.info(f"   Has data analysis functions: {has_data_analysis}")
+                
+                if has_data_analysis:
+                    analytical_func_names = [
+                        resp.get('function_response', {}).get('name') 
+                        for resp in function_responses 
+                        if resp.get('function_response', {}).get('name') in analytical_functions
+                    ]
+                    logging.info(f"   Analytical functions called: {analytical_func_names}")
+                    
+                    try:
+                        logging.info("🚀 TRIGGERING FOOTNOTE GENERATION")
+                        # Generate explanatory footnotes
+                        footnotes = generate_specific_examples(current_message, final_response_text)
+                        if footnotes:
+                            logging.info(f"✅ Footnotes generated, streaming to user: {len(footnotes)} characters")
+                            yield f'0:{json.dumps(footnotes)}\n'
+                        else:
+                            logging.warning("⚠️  No footnotes returned from generate_specific_examples")
+                    except Exception as e:
+                        logging.error(f"❌ Error generating footnotes: {str(e)}")
+                        import traceback
+                        logging.error(f"📋 Full traceback: {traceback.format_exc()}")
+                        # Continue without footnotes if there's an error
+                else:
+                    logging.info("ℹ️  No analytical functions detected, skipping footnote generation")
             
             # After streaming the final response, end the stream
             yield 'e:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0},"isContinued":false}\n'
         else:
+            # If there were no function calls but the user might have asked about data, 
+            # still try to generate footnotes if it seems data-related
+            if current_message and any(keyword in current_message.lower() for keyword in [
+                'graph', 'chart', 'data', 'analysis', 'trend', 'pattern', 'why', 'because', 'reason'
+            ]):
+                try:
+                    footnotes = generate_specific_examples(current_message, "")
+                    if footnotes:
+                        yield f'0:{json.dumps(footnotes)}\n'
+                except Exception as e:
+                    logging.error(f"Error generating footnotes for non-function response: {str(e)}")
+            
             # If there were no function calls, end the stream now
             yield 'e:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0},"isContinued":false}\n'
 
@@ -558,9 +674,10 @@ async def handle_chat_data(request: FastAPIRequest, protocol: str = Query('data'
         request_data = Request(**body)
         
         messages = request_data.messages
+        web_search_enabled = request_data.webSearchEnabled
         gemini_messages = convert_to_gemini_messages(messages)
 
-        response = StreamingResponse(stream_text(gemini_messages, protocol))
+        response = StreamingResponse(stream_text(gemini_messages, protocol, web_search_enabled))
         response.headers['x-vercel-ai-data-stream'] = 'v1'
         return response
     except ValidationError as e:

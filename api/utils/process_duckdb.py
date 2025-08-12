@@ -386,7 +386,7 @@ def get_sql_queries(user_prompt: str, columns_info: dict) -> List[str]:
         genai.configure(api_key=api_key)
         
         # Create the model
-        model = genai.GenerativeModel('gemini-2.5-pro')
+        model = genai.GenerativeModel('gemini-2.5-flash-lite')
         
         # Format schema information for the prompt
         schema_text = _format_schema_for_prompt(columns_info)
@@ -413,6 +413,12 @@ Requirements:
    - Use 'DATE_PART' or 'EXTRACT' for extracting date parts
    - Use 'STRPTIME' instead of 'STR_TO_DATE' for parsing dates
    - Refer to DuckDB documentation for other function names if unsure
+
+SPECIAL INSTRUCTIONS FOR COMPREHENSIVE ANALYSIS:
+- If the question asks about "most leads", "highest volume", or similar superlatives, generate queries that show ALL time periods (months/quarters/years) with their counts, not just the maximum
+- For temporal questions, always include comprehensive breakdowns (e.g., all months, not just the peak month)
+- For comparison questions, provide complete datasets that allow full comparison across all relevant dimensions
+- Use ORDER BY and LIMIT appropriately, but ensure the query provides enough context for complete analysis
 
 Return your response as a JSON array of SQL query strings. Example format:
 ["SELECT * FROM table1 WHERE condition", "SELECT COUNT(*) FROM table2"]
@@ -605,7 +611,7 @@ def generate_response(user_prompt: str, sql_queries: List[str], query_results: L
         genai.configure(api_key=api_key)
         
         # Create the model
-        model = genai.GenerativeModel('gemini-2.5-pro')
+        model = genai.GenerativeModel('gemini-2.5-flash-lite')
         
         # Format query results for the prompt
         results_text = _format_query_results_for_prompt(sql_queries, query_results)
@@ -628,10 +634,11 @@ Requirements:
 4. Use clear, non-technical language that anyone can understand
 5. If multiple queries were executed, synthesize the results coherently
 6. If no data was found, explain what this means in context
-7. Suggest follow-up questions if relevant and the data supports them
-8. Keep the response concise but comprehensive
+7. ONLY suggest follow-up questions if the query results are incomplete or if there are obvious gaps in the data that would require additional analysis
+8. If you have comprehensive data that fully answers the question (like monthly breakdowns, comparisons, or complete datasets), provide a complete answer without suggesting to look at additional data
+9. Keep the response concise but comprehensive
 
-Generate a comprehensive but concise response that directly answers the user's question."""
+Generate a comprehensive but concise response that directly answers the user's question. If you have all the data needed to fully answer the question, provide a complete response without suggesting additional analysis."""
 
         # Generate content with safety settings
         safety_settings = {
