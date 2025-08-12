@@ -8,6 +8,7 @@ import { Markdown } from "./markdown";
 import { PreviewAttachment } from "./preview-attachment";
 import { cn } from "@/lib/utils";
 import { Weather } from "./weather";
+import { Graph } from "./graph";
 
 export const PreviewMessage = ({
   message,
@@ -36,7 +37,7 @@ export const PreviewMessage = ({
 
         <div className="flex flex-col gap-2 w-full">
           {message.content && (
-            <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-4 overflow-x-auto">
               <Markdown>{message.content as string}</Markdown>
             </div>
           )}
@@ -50,9 +51,13 @@ export const PreviewMessage = ({
                   const { result } = toolInvocation;
 
                   return (
-                    <div key={toolCallId}>
+                    <div key={toolCallId} className="overflow-x-auto">
                       {toolName === "get_current_weather" ? (
                         <Weather weatherAtLocation={result} />
+                      ) : toolName === "create_graph" ? (
+                        <Graph graphData={result} />
+                      ) : toolName === "create_graph_from_duckdb" ? (
+                        <Graph graphData={result} />
                       ) : (
                         <pre>{JSON.stringify(result, null, 2)}</pre>
                       )}
@@ -63,10 +68,10 @@ export const PreviewMessage = ({
                   <div
                     key={toolCallId}
                     className={cn({
-                      skeleton: ["get_current_weather"].includes(toolName),
+                      skeleton: ["get_current_weather", "create_graph", "create_graph_from_duckdb"].includes(toolName),
                     })}
                   >
-                    {toolName === "get_current_weather" ? <Weather /> : null}
+                    {toolName === "get_current_weather" ? <Weather /> : toolName === "create_graph" || toolName === "create_graph_from_duckdb" ? <div className="skeleton w-full h-64" /> : null}
                   </div>
                 );
               })}

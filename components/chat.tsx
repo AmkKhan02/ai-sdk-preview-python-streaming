@@ -21,7 +21,8 @@ export function Chat() {
     isLoading,
     stop,
   } = useChat({
-    maxSteps: 4,
+    api: '/api/chat',
+    maxSteps: 1,
     onError: (error) => {
       if (error.message.includes("Too many requests")) {
         toast.error(

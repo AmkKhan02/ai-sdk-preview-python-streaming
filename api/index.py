@@ -1,41 +1,91 @@
 import os
 import json
-from typing import List
-from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
-from pydantic import BaseModel
+import uuid
+import logging
+import tempfile
+from typing import List, Dict, Any
+from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
-from fastapi.responses import StreamingResponse
-from openai import OpenAI
-from .utils.prompt import ClientMessage, convert_to_openai_messages
-from .utils.tools import get_current_weather
-
+from fastapi import FastAPI, Query, Request as FastAPIRequest, File, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+import google.generativeai as genai
+from .utils.prompt import ClientMessage, convert_to_gemini_messages
+from .utils.tools import get_current_weather, create_graph, execute_analytical_query, execute_analytical_query_detailed, list_available_databases, create_graph_from_duckdb
+from .utils.process_duckdb import process_duckdb_file, DuckDBProcessingError, extract_clean_response
+from .utils.file_registry import file_registry
+from .utils.web_search_llm import generate_web_search_query, answer_web_search_question
+from .utils.search_web import search_web
+from .utils.generate_examples import generate_specific_examples
 
 load_dotenv(".env.local")
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
 app = FastAPI()
 
-client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY"),
-)
-
+# Configure Gemini
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 class Request(BaseModel):
     messages: List[ClientMessage]
+    webSearchEnabled: bool = False
 
+class DuckDBProcessingResult(BaseModel):
+    columns: List[str]
+    table_name: str
+    all_tables: List[str]
+    file_size: int
+    status: str
+    db_path: str = None  # Path to the database file for analytical queries
+    error: str = None
+
+class AnalyticalQueryRequest(BaseModel):
+    question: str
+    db_path: str
+    session_id: str = None
 
 available_tools = {
     "get_current_weather": get_current_weather,
+    "create_graph": create_graph,
+    "execute_analytical_query": execute_analytical_query,
+    "execute_analytical_query_detailed": execute_analytical_query_detailed,
+    "list_available_databases": list_available_databases,
+    "create_graph_from_duckdb": create_graph_from_duckdb,
 }
 
-def do_stream(messages: List[ChatCompletionMessageParam]):
-    stream = client.chat.completions.create(
-        messages=messages,
-        model="gpt-4o",
-        stream=True,
-        tools=[{
-            "type": "function",
-            "function": {
+def to_serializable(obj):
+    """Recursively converts Gemini's internal types to JSON serializable formats."""
+    # Handle Gemini's Struct type (common in function call args)
+    if hasattr(obj, '_pb'):  # Protocol buffer object
+        if hasattr(obj, 'keys') and hasattr(obj, 'values'):
+            return {key: to_serializable(obj[key]) for key in obj.keys()}
+        elif hasattr(obj, '__iter__'):
+            return [to_serializable(item) for item in obj]
+    
+    # Handle dictionary-like objects
+    if hasattr(obj, 'items'):
+        return {key: to_serializable(value) for key, value in obj.items()}
+    
+    # Handle list-like objects (including RepeatedComposite)
+    if isinstance(obj, list) or type(obj).__name__ in ['RepeatedCompositeFieldContainer', 'RepeatedComposite']:
+        return [to_serializable(item) for item in obj]
+    
+    # Handle basic types
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    
+    # Fallback: try to convert to string
+    try:
+        return str(obj)
+    except:
+        return None
+
+# Define tools for Gemini
+gemini_tools = [
+    {
+        "function_declarations": [
+            {
                 "name": "get_current_weather",
                 "description": "Get the current weather at a location",
                 "parameters": {
@@ -53,101 +103,586 @@ def do_stream(messages: List[ChatCompletionMessageParam]):
                     "required": ["latitude", "longitude"],
                 },
             },
-        }]
-    )
-
-    return stream
-
-def stream_text(messages: List[ChatCompletionMessageParam], protocol: str = 'data'):
-    draft_tool_calls = []
-    draft_tool_calls_index = -1
-
-    stream = client.chat.completions.create(
-        messages=messages,
-        model="gpt-4o",
-        stream=True,
-        tools=[{
-            "type": "function",
-            "function": {
-                "name": "get_current_weather",
-                "description": "Get the current weather at a location",
+            {
+                "name": "create_graph",
+                "description": "Create a graph from a list of data points",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "latitude": {
-                            "type": "number",
-                            "description": "The latitude of the location",
+                        "data": {
+                            "type": "array",
+                            "description": "A list of dictionaries representing the data points",
+                            "items": {
+                                "type": "object"
+                            }
                         },
-                        "longitude": {
-                            "type": "number",
-                            "description": "The longitude of the location",
+                        "graph_type": {
+                            "type": "string",
+                            "description": "The type of graph to generate (e.g., 'bar', 'line')",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "The title of the graph",
+                        },
+                        "x_label": {
+                            "type": "string",
+                            "description": "The label for the x-axis",
+                        },
+                        "y_label": {
+                            "type": "string",
+                            "description": "The label for the y-axis",
                         },
                     },
-                    "required": ["latitude", "longitude"],
+                    "required": ["data", "graph_type"],
                 },
             },
-        }]
-    )
+            {
+                "name": "execute_analytical_query",
+                "description": "Execute analytical queries against uploaded DuckDB databases to answer data questions",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The analytical question to answer using the database",
+                        },
+                        "db_path": {
+                            "type": "string",
+                            "description": "Path to the DuckDB database file (use the path from the upload response)",
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Optional session ID for follow-up queries to maintain context",
+                        },
+                    },
+                    "required": ["question", "db_path"],
+                },
+            },
+            {
+                "name": "list_available_databases",
+                "description": "List all available DuckDB databases that have been uploaded and can be used for analysis",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+            {
+                "name": "create_graph_from_duckdb",
+                "description": "Create a graph/chart from DuckDB data using natural language requests. Uses AI to generate appropriate SQL queries and create visualizations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "natural_language_request": {
+                            "type": "string",
+                            "description": "Natural language description of what to visualize (e.g., 'Show me sales by month', 'Compare revenue across regions')",
+                        },
+                        "db_path": {
+                            "type": "string",
+                            "description": "Path to the DuckDB database file",
+                        },
+                        "graph_type": {
+                            "type": "string",
+                            "description": "Type of graph to generate: 'bar', 'line', 'scatter', or 'pie'",
+                            "enum": ["bar", "line", "scatter", "pie"]
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Title for the graph",
+                        },
+                        "x_label": {
+                            "type": "string",
+                            "description": "Label for the x-axis",
+                        },
+                        "y_label": {
+                            "type": "string",
+                            "description": "Label for the y-axis",
+                        },
+                    },
+                    "required": ["natural_language_request", "db_path"],
+                },
+            }
+        ]
+    }
+]
 
-    for chunk in stream:
-        for choice in chunk.choices:
-            if choice.finish_reason == "stop":
-                continue
+def stream_text(messages_data: Dict, protocol: str = 'data', web_search_enabled: bool = False):
+    try:
+        logging.info(f"Data sent to Gemini: {messages_data}")
+        
+        # Default system instruction for analytical capabilities
+        default_system_instruction = """You are an AI assistant with advanced data analysis capabilities. 
 
-            elif choice.finish_reason == "tool_calls":
-                for tool_call in draft_tool_calls:
-                    yield '9:{{"toolCallId":"{id}","toolName":"{name}","args":{args}}}\n'.format(
-                        id=tool_call["id"],
-                        name=tool_call["name"],
-                        args=tool_call["arguments"])
+When users upload DuckDB database files, you can analyze them using the execute_analytical_query tool and create visualizations using the create_graph_from_duckdb tool.
 
-                for tool_call in draft_tool_calls:
-                    tool_result = available_tools[tool_call["name"]](
-                        **json.loads(tool_call["arguments"]))
+ANALYTICAL QUERIES:
+The execute_analytical_query tool:
+- Automatically generates and executes SQL queries based on the user's question
+- Uses AI to create a natural language response with insights
+- Returns only the essential answer without exposing technical details
+- Handles follow-up questions using session context
+- Ensures DuckDB-compatible SQL syntax (uses 'julian' function instead of 'JULIANDAY')
 
-                    yield 'a:{{"toolCallId":"{id}","toolName":"{name}","args":{args},"result":{result}}}\n'.format(
-                        id=tool_call["id"],
-                        name=tool_call["name"],
-                        args=tool_call["arguments"],
-                        result=json.dumps(tool_result))
+GRAPH GENERATION:
+The create_graph_from_duckdb tool:
+- Creates charts and graphs from DuckDB data using natural language requests
+- Automatically generates appropriate SQL queries for visualization data
+- Supports bar charts, line charts, scatter plots, and pie charts
+- Returns base64-encoded images that are automatically displayed
 
-            elif choice.delta.tool_calls:
-                for tool_call in choice.delta.tool_calls:
-                    id = tool_call.id
-                    name = tool_call.function.name
-                    arguments = tool_call.function.arguments
+IMPORTANT: When a user asks questions about their uploaded data:
 
-                    if (id is not None):
-                        draft_tool_calls_index += 1
-                        draft_tool_calls.append(
-                            {"id": id, "name": name, "arguments": ""})
+1. If you don't know what databases are available, use the list_available_databases tool first to see what files have been uploaded.
 
+2. For data analysis, use the execute_analytical_query tool with:
+   - question: The user's question about the data
+   - db_path: You can use either the full database path OR just the filename (e.g., "leads_data.duckdb")
+   - session_id: Optional, for follow-up queries to maintain context
+
+3. For visualizations, use the create_graph_from_duckdb tool with:
+   - natural_language_request: Description of what to visualize (e.g., "Show sales by month", "Compare revenue by region")
+   - db_path: Path to the DuckDB database file
+   - graph_type: Type of chart ("bar", "line", "scatter", "pie")
+   - title, x_label, y_label: Optional labels for the chart
+
+The tools will automatically:
+- Extract database schema information
+- Generate appropriate SQL queries using AI (with DuckDB-compatible syntax)
+- Execute the queries against the database
+- Generate comprehensive responses or visualizations
+
+You can answer questions like:
+- "Describe the data I've uploaded"
+- "What is the most common marketing source?"
+- "Show me a bar chart of sales by month"
+- "Create a pie chart of leads by industry"
+- "Graph the conversion rates over time"
+
+If no databases are available, ask the user to upload their DuckDB file first.
+
+Always use the appropriate tool when users ask questions about their uploaded database data or request visualizations."""
+
+        # Handle web search if enabled
+        web_search_results = None
+        current_user_message = ""
+        
+        if web_search_enabled:
+            # Extract the current user message
+            contents = messages_data.get("contents", [])
+            if contents:
+                last_message = contents[-1]
+                if last_message.get("role") == "user" and last_message.get("parts"):
+                    current_user_message = last_message["parts"][0].get("text", "")
+                    
+                    if current_user_message.strip():
+                        try:
+                            # Generate web search query
+                            logging.info(f"Web search enabled. Generating search query for: {current_user_message}")
+                            search_query = generate_web_search_query(current_user_message)
+                            
+                            # Perform web search
+                            logging.info(f"Performing web search with query: {search_query}")
+                            web_search_results = search_web(search_query)
+                            
+                            # Generate answer based on web search results
+                            web_answer = answer_web_search_question(current_user_message, web_search_results)
+                            
+                            # Yield the web search answer first
+                            yield f'0:{json.dumps(f"Web Search Results:\n\n{web_answer}\n\n")}\n'
+                            
+                        except Exception as e:
+                            logging.error(f"Web search error: {str(e)}")
+                            if "TAVILY_API_KEY" in str(e):
+                                yield f'0:{json.dumps("⚠️ Web Search Error: Tavily API key not configured. Please add your TAVILY_API_KEY to your .env.local file to enable web search functionality. Proceeding with standard response.\n\n")}\n'
+                            else:
+                                yield f'0:{json.dumps(f"⚠️ Web search encountered an error: {str(e)}. Proceeding with standard response.\n\n")}\n'
+
+        # Use provided system instruction or default
+        system_instruction = messages_data.get("system_instruction")
+        if system_instruction:
+            # Combine with default instruction
+            combined_instruction = f"{default_system_instruction}\n\nAdditional instructions:\n{system_instruction}"
+        else:
+            combined_instruction = default_system_instruction
+        
+        # Initialize the model
+        model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash-lite",
+            tools=gemini_tools,
+            system_instruction=combined_instruction
+        )
+
+        # Start chat with history
+        contents = messages_data.get("contents", [])
+        
+        # If we have previous messages, use them as history
+        if len(contents) > 1:
+            chat = model.start_chat(history=contents[:-1])
+            # Get the last message as the current prompt
+            current_message = contents[-1]["parts"][0]["text"] if contents else ""
+        else:
+            chat = model.start_chat()
+            current_message = contents[0]["parts"][0]["text"] if contents else ""
+            
+        # If web search was performed and no web search results were already yielded (due to error),
+        # and we want to continue with normal LLM processing, we can augment the message with web context
+        if web_search_enabled and web_search_results and current_user_message:
+            # Enhance the message with web search context for LLM processing
+            enhanced_message = f"""
+User Question: {current_user_message}
+
+Web Search Context (use this to provide more comprehensive answers):
+{web_search_results}
+
+Please provide a comprehensive response that combines your knowledge with the web search information above.
+"""
+            current_message = enhanced_message
+
+        # Generate streaming response
+        response = chat.send_message(
+            current_message,
+            stream=True,
+        )
+
+        # Track function calls to avoid duplicates
+        processed_function_calls = set()
+        function_responses = []
+
+        # First pass: collect all function calls and execute them
+        for chunk in response:
+            logging.info(f"Raw response from Gemini: {chunk}")
+            # Handle text content
+            if hasattr(chunk, 'text') and chunk.text:
+                yield f'0:{json.dumps(chunk.text)}\n'
+            
+            # Handle function calls
+            if hasattr(chunk, 'candidates') and chunk.candidates:
+                candidate = chunk.candidates[0]
+                if hasattr(candidate, 'content') and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'function_call'):
+                            function_call = part.function_call
+                            
+                            # Create a unique identifier for this function call
+                            call_signature = f"{function_call.name}_{hash(str(function_call.args))}"
+                            
+                            # Skip if we've already processed this exact function call
+                            if call_signature in processed_function_calls:
+                                continue
+                                
+                            processed_function_calls.add(call_signature)
+                            tool_call_id = str(uuid.uuid4())
+                            
+                            # Convert args from struct to dict
+                            args = {}
+                            if hasattr(function_call, 'args') and function_call.args is not None:
+                                args = to_serializable(function_call.args)
+                            
+                            # Yield tool call
+                            yield f'9:{{"toolCallId":"{tool_call_id}","toolName":"{function_call.name}","args":{json.dumps(args)}}}\n'
+                            logging.info(f"Executing tool: {function_call.name} with args: {args}")
+                            
+                            # Execute the function
+                            if function_call.name in available_tools:
+                                try:
+                                    result = available_tools[function_call.name](**args)
+                                    logging.info(f"Tool result: {result}")
+                                    
+                                    # For analytical query functions, extract clean response
+                                    if function_call.name in ['execute_analytical_query', 'execute_analytical_query_detailed']:
+                                        clean_result = extract_clean_response(result)
+                                        # Create a clean response structure for the model
+                                        model_result = {
+                                            "success": result.get('success', False),
+                                            "answer": clean_result,
+                                            "session_id": result.get('session_id', 'unknown')
+                                        }
+                                    else:
+                                        model_result = result
+                                    
+                                    # Yield tool result (this goes to the UI)
+                                    yield f'a:{{"toolCallId":"{tool_call_id}","toolName":"{function_call.name}","args":{json.dumps(args)},"result":{json.dumps(model_result)}}}\n'
+                                    
+                                    # Store function response for sending back to model
+                                    function_responses.append({
+                                        "function_response": {
+                                            "name": function_call.name,
+                                            "response": model_result
+                                        }
+                                    })
+                                                                        
+                                except Exception as e:
+                                    error_result = {"error": str(e)}
+                                    yield f'a:{{"toolCallId":"{tool_call_id}","toolName":"{function_call.name}","args":{json.dumps(args)},"result":{json.dumps(error_result)}}}\n'
+                                    
+                                    # Store error response
+                                    function_responses.append({
+                                        "function_response": {
+                                            "name": function_call.name,
+                                            "response": error_result
+                                        }
+                                    })
+
+        # If we have function responses, send them all back to the model in one go
+        if function_responses:
+            # Extract clean answers from function responses
+            clean_parts = []
+            
+            for func_resp in function_responses:
+                if 'function_response' in func_resp:
+                    response_data = func_resp['function_response']['response']
+                    
+                    # For analytical queries, use just the answer
+                    if func_resp['function_response']['name'] in ['execute_analytical_query', 'execute_analytical_query_detailed']:
+                        if isinstance(response_data, dict) and 'answer' in response_data:
+                            clean_parts.append(response_data['answer'])
+                        else:
+                            clean_parts.append(str(response_data))
                     else:
-                        draft_tool_calls[draft_tool_calls_index]["arguments"] += arguments
-
-            else:
-                yield '0:{text}\n'.format(text=json.dumps(choice.delta.content))
-
-        if chunk.choices == []:
-            usage = chunk.usage
-            prompt_tokens = usage.prompt_tokens
-            completion_tokens = usage.completion_tokens
-
-            yield 'e:{{"finishReason":"{reason}","usage":{{"promptTokens":{prompt},"completionTokens":{completion}}},"isContinued":false}}\n'.format(
-                reason="tool-calls" if len(
-                    draft_tool_calls) > 0 else "stop",
-                prompt=prompt_tokens,
-                completion=completion_tokens
+                        # For other functions, convert to string
+                        clean_parts.append(str(response_data))
+            
+            consolidated_response = {
+                "parts": clean_parts + ["Based on the analysis above, provide a natural language response to the user. Do not include any JSON, code blocks, or structured data."]
+            }
+            
+            logging.info(f"Sending consolidated function responses to model: {len(function_responses)} responses")
+            logging.info(f"Consolidated response structure: {consolidated_response}")
+            
+            # Send all function responses back to the model for a final, consolidated response
+            final_response = chat.send_message(
+                consolidated_response,
+                stream=True,
             )
+            
+            # Collect the final response text for footnote generation
+            final_response_text = ""
+            
+            # Stream the final text response from the model
+            for chunk in final_response:
+                if hasattr(chunk, 'text') and chunk.text:
+                    final_response_text += chunk.text
+                    yield f'0:{json.dumps(chunk.text)}\n'
+            
+            # Generate and append footnotes if we have analytical results
+            if final_response_text and function_responses:
+                # Check if any function responses were analytical or graph-related
+                analytical_functions = [
+                    'execute_analytical_query', 
+                    'execute_analytical_query_detailed', 
+                    'create_graph_from_duckdb'
+                ]
+                
+                has_data_analysis = any(
+                    resp.get('function_response', {}).get('name') in analytical_functions
+                    for resp in function_responses
+                )
+                
+                logging.info(f"🔍 Checking for footnote generation trigger:")
+                logging.info(f"   Final response text length: {len(final_response_text)}")
+                logging.info(f"   Function responses: {len(function_responses)}")
+                logging.info(f"   Has data analysis functions: {has_data_analysis}")
+                
+                if has_data_analysis:
+                    analytical_func_names = [
+                        resp.get('function_response', {}).get('name') 
+                        for resp in function_responses 
+                        if resp.get('function_response', {}).get('name') in analytical_functions
+                    ]
+                    logging.info(f"   Analytical functions called: {analytical_func_names}")
+                    
+                    try:
+                        logging.info("🚀 TRIGGERING FOOTNOTE GENERATION")
+                        # Generate explanatory footnotes
+                        footnotes = generate_specific_examples(current_message, final_response_text)
+                        if footnotes:
+                            logging.info(f"✅ Footnotes generated, streaming to user: {len(footnotes)} characters")
+                            yield f'0:{json.dumps(footnotes)}\n'
+                        else:
+                            logging.warning("⚠️  No footnotes returned from generate_specific_examples")
+                    except Exception as e:
+                        logging.error(f"❌ Error generating footnotes: {str(e)}")
+                        import traceback
+                        logging.error(f"📋 Full traceback: {traceback.format_exc()}")
+                        # Continue without footnotes if there's an error
+                else:
+                    logging.info("ℹ️  No analytical functions detected, skipping footnote generation")
+            
+            # After streaming the final response, end the stream
+            yield 'e:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0},"isContinued":false}\n'
+        else:
+            # If there were no function calls but the user might have asked about data, 
+            # still try to generate footnotes if it seems data-related
+            if current_message and any(keyword in current_message.lower() for keyword in [
+                'graph', 'chart', 'data', 'analysis', 'trend', 'pattern', 'why', 'because', 'reason'
+            ]):
+                try:
+                    footnotes = generate_specific_examples(current_message, "")
+                    if footnotes:
+                        yield f'0:{json.dumps(footnotes)}\n'
+                except Exception as e:
+                    logging.error(f"Error generating footnotes for non-function response: {str(e)}")
+            
+            # If there were no function calls, end the stream now
+            yield 'e:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0},"isContinued":false}\n'
 
+    except Exception as e:
+        # Handle errors
+        logging.error(f"An error occurred in stream_text: {str(e)}")
+        yield f'0:{json.dumps(f"Error: {str(e)}")}\n'
+        yield 'e:{"finishReason":"error","usage":{"promptTokens":0,"completionTokens":0},"isContinued":false}\n'
+        
+@app.post("/api/upload-duckdb")
+async def upload_duckdb_file(file: UploadFile = File(...)):
+    """
+    Upload and process a DuckDB file to extract column information.
+    
+    Args:
+        file: The uploaded DuckDB file
+        
+    Returns:
+        JSON response with column information and processing status
+        
+    Raises:
+        HTTPException: For various error conditions
+    """
+    # File size validation (10MB limit)
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
+    
+    # Validate file extension
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    
+    allowed_extensions = ['.duckdb', '.db']
+    file_extension = os.path.splitext(file.filename.lower())[1]
+    if file_extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid file type. Only {', '.join(allowed_extensions)} files are allowed"
+        )
+    
+    # Create temporary file
+    temp_file_path = None
+    try:
+        # Read file content
+        file_content = await file.read()
+        
+        # Validate file size
+        if len(file_content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413, 
+                detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB"
+            )
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+            temp_file.write(file_content)
+            temp_file_path = temp_file.name
+        
+        # Process the DuckDB file
+        try:
+            logging.info(f"Processing DuckDB file: {temp_file_path}, size: {len(file_content)} bytes")
+            result = process_duckdb_file(temp_file_path, cleanup=False)
+            logging.info(f"DuckDB processing result: {result}")
+            
+            if result['status'] == 'error':
+                raise HTTPException(
+                    status_code=422, 
+                    detail=f"Failed to process DuckDB file: {result.get('error', 'Unknown error')}"
+                )
+            
+            # Register file in the registry for analytical queries
+            try:
+                file_id = file_registry.register_file(
+                    filename=file.filename,
+                    db_path=result['db_path'],
+                    metadata=result
+                )
+                logging.info(f"Registered file in registry: {file_id}")
+            except Exception as e:
+                logging.warning(f"Failed to register file in registry: {e}")
+            
+            # Return successful response
+            return DuckDBProcessingResult(**result)
+            
+        except DuckDBProcessingError as e:
+            raise HTTPException(status_code=422, detail=f"DuckDB processing error: {str(e)}")
+        except Exception as e:
+            logging.error(f"Unexpected error processing DuckDB file: {str(e)}")
+            raise HTTPException(status_code=500, detail="Internal server error during file processing")
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error in upload endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        # Note: We don't cleanup the temporary file here as it needs to persist
+        # for analytical queries. The session manager will handle cleanup when sessions expire.
+        pass
 
-
+@app.post("/api/analyze-duckdb")
+async def analyze_duckdb(request: AnalyticalQueryRequest):
+    """
+    Execute analytical queries against DuckDB databases with clean text responses.
+    
+    This endpoint provides analytical results with only clean text responses,
+    never exposing JSON structure to users.
+    
+    Args:
+        request: AnalyticalQueryRequest containing question, db_path, and optional session_id
+        
+    Returns:
+        JSON response with clean text answer only
+        
+    Raises:
+        HTTPException: For various error conditions
+    """
+    try:
+        # Execute the detailed analytical query
+        result = execute_analytical_query_detailed(
+            question=request.question,
+            db_path=request.db_path,
+            session_id=request.session_id
+        )
+        
+        if not result.get('success', False):
+            # Return clean error message, not JSON structure
+            error_message = result.get('error', 'Analytical query failed')
+            return {"response": f"I encountered an error while analyzing your data: {error_message}"}
+        
+        # Extract and return only the clean answer text
+        clean_answer = extract_clean_response(result)
+        return {"response": clean_answer}
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error in analyze-duckdb endpoint: {str(e)}")
+        # Return clean error message, not technical details
+        return {"response": "I encountered an unexpected error while analyzing your data. Please try again or contact support if the issue persists."}
 
 @app.post("/api/chat")
-async def handle_chat_data(request: Request, protocol: str = Query('data')):
-    messages = request.messages
-    openai_messages = convert_to_openai_messages(messages)
+async def handle_chat_data(request: FastAPIRequest, protocol: str = Query('data')):
+    try:
+        body = await request.json()
+        logging.info(f"Request body: {body}")
+        
+        # Manually validate the request body
+        request_data = Request(**body)
+        
+        messages = request_data.messages
+        web_search_enabled = request_data.webSearchEnabled
+        gemini_messages = convert_to_gemini_messages(messages)
 
-    response = StreamingResponse(stream_text(openai_messages, protocol))
-    response.headers['x-vercel-ai-data-stream'] = 'v1'
-    return response
+        response = StreamingResponse(stream_text(gemini_messages, protocol, web_search_enabled))
+        response.headers['x-vercel-ai-data-stream'] = 'v1'
+        return response
+    except ValidationError as e:
+        logging.error(f"Validation error: {e.errors()}")
+        return JSONResponse(status_code=422, content={"detail": e.errors()})
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {str(e)}")
+        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
